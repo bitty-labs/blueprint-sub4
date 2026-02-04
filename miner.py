@@ -228,9 +228,9 @@ def main(config: dict):
     # Enhanced first iteration - good exploration
     n_samples_first_iteration = base_n_samples * 4 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 2
 
-    # Mode tracking - iterations 1-9: GA/Synthon, 10-19: Amplification, 20+: Exploit
+    # Mode tracking - iterations 1-9: GA/Synthon, 10-34: Amplification (25 rounds), 35+: Exploit
     amplification_start_iteration = 10
-    exploit_start_iteration = 20
+    exploit_start_iteration = 35
     use_amplification_mode = False
     use_exploit_mode = False
     seen_names = set()  # Track all molecule names for exploit/amplification
