@@ -14,7 +14,7 @@ load_dotenv(override=True)
 warnings.filterwarnings("ignore", category=pd.errors.SettingWithCopyWarning)
 from nova_ph2.combinatorial_db.reactions import get_smiles_from_reaction, get_reaction_info
 from nova_ph2.utils.molecules import get_heavy_atom_count
-from collections import defaultdict
+from collections import defaultdict, Counter
 from itertools import chain
 import numpy as np
 import math
@@ -2518,3 +2518,910 @@ def _generate_pattern_guided_exploration(
             candidates.append(name)
 
     return candidates
+
+
+# =============================================================================
+# PROGRESSIVE AMPLIFICATION STATE - Full famy.py implementation
+# Uses molecules.py infrastructure + famy.py's progressive learning strategies
+# =============================================================================
+
+class ProgressiveAmplificationState:
+    """
+    Progressive Elite Winner Pattern Amplifier with Adaptive Learning.
+
+    Replicates famy.py's full progressive learning amplification:
+    - Learning memory that persists across rounds
+    - 4 strategies with adaptive weights
+    - Memory-guided reactant selection
+    - Pattern analysis and tracking
+
+    The miner's top_pool (100 molecules) serves as the elite winners,
+    similar to high_binders.db in famy.py.
+
+    Uses molecules.py's infrastructure for DB access and molecule generation.
+    """
+
+    def __init__(self, db_path: str, rxn_id: int):
+        self.db_path = db_path
+        self.rxn_id = rxn_id
+        self.current_round = 0
+
+        # Load reaction info (using molecules.py's function)
+        self.reaction_info = get_reaction_info(rxn_id, db_path)
+        if not self.reaction_info:
+            raise ValueError(f"Could not load reaction {rxn_id}")
+
+        self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
+        self.is_three_component = self.roleC is not None and self.roleC != 0
+
+        # Load all components (using molecules.py's function)
+        self.molecules_A = get_molecules_by_role(self.roleA, db_path)
+        self.molecules_B = get_molecules_by_role(self.roleB, db_path)
+        self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
+
+        # Build mol_id -> smiles lookup
+        self.id_to_smiles_A = {m[0]: m[1] for m in self.molecules_A}
+        self.id_to_smiles_B = {m[0]: m[1] for m in self.molecules_B}
+        self.id_to_smiles_C = {m[0]: m[1] for m in self.molecules_C} if self.is_three_component else {}
+
+        # Build fingerprint caches (using MACCSkeys like famy.py)
+        self.fingerprint_cache = {}
+        self.pattern_cache = {}
+        self._precompute_fingerprints_and_patterns()
+
+        # Learning memory (same structure as famy.py)
+        self.learning_memory = {
+            # Molecule tracking across all rounds
+            'all_discovered_molecules': {},  # name -> {score, round, etc.}
+            'elite_evolution': [],  # Track how elite pool evolves each round
+            'cumulative_elites': {},  # All molecules that have ever been elite
+
+            # Strategy performance tracking
+            'strategy_performance': {
+                'elite_winner_amplification': {'successes': 0, 'total': 0, 'avg_score': 0.0},
+                'elite_similar_combinations': {'successes': 0, 'total': 0, 'avg_score': 0.0},
+                'successful_reaction_focus': {'successes': 0, 'total': 0, 'avg_score': 0.0},
+                'pattern_guided_exploration': {'successes': 0, 'total': 0, 'avg_score': 0.0}
+            },
+
+            # Reactant success memory (key difference from simple amplification)
+            'successful_reactants_memory': defaultdict(lambda: {'usage_count': 0, 'avg_score': 0.0}),
+            'successful_reactions_memory': defaultdict(lambda: {'usage_count': 0, 'avg_score': 0.0, 'max_score': 0.0}),
+
+            # Pattern evolution
+            'pattern_evolution': [],  # Track how patterns change each round
+            'cumulative_patterns': Counter(),  # All successful patterns ever seen
+
+            # Performance metrics
+            'round_performance': [],
+            'convergence_metrics': {
+                'improvement_threshold': 0.001,
+                'rounds_without_improvement': 0,
+                'best_score_ever': 0.0,
+                'best_score_round': 0
+            }
+        }
+
+        # Adaptive strategy weights (from famy.py)
+        self.adaptive_strategy_weights = {
+            'elite_winner_amplification': 0.5,
+            'elite_similar_combinations': 0.3,
+            'successful_reaction_focus': 0.15,
+            'pattern_guided_exploration': 0.05
+        }
+
+        # Duplicate prevention across all rounds
+        self.used_reactions = set()
+
+        # Elite winner data (set by select_elite_winners)
+        self.elite_winners = []  # List of dicts from top_pool
+        self.elite_winner_patterns = {}  # Fingerprints and patterns from elite winners
+        self.successful_reactants = []  # Reactants extracted from elite winners
+        self.elite_winner_like_reactants = {}  # Similar reactants by role
+
+        bt.logging.info(f"[ProgressiveAmp] Initialized: rxn:{rxn_id}, "
+                       f"A={len(self.molecules_A)}, B={len(self.molecules_B)}, "
+                       f"C={len(self.molecules_C) if self.is_three_component else 0}")
+
+    def _precompute_fingerprints_and_patterns(self):
+        """Precompute fingerprints and patterns for all reactants."""
+        all_molecules = self.molecules_A + self.molecules_B + self.molecules_C
+
+        for mol_id, smiles, _ in all_molecules:
+            # Fingerprint (MACCS like famy.py)
+            mol = _mol_from_smiles_cached(smiles)
+            if mol:
+                try:
+                    fp = MACCSkeys.GenMACCSKeys(mol)
+                    self.fingerprint_cache[mol_id] = fp
+                except:
+                    pass
+
+            # Patterns (using CHEMICAL_PATTERNS from molecules.py)
+            patterns_found = []
+            for pattern_name, pattern_str in CHEMICAL_PATTERNS:
+                if pattern_str in smiles:
+                    patterns_found.append(pattern_name)
+            self.pattern_cache[mol_id] = patterns_found
+
+    def select_elite_winners(self, top_pool: List[Dict]):
+        """
+        Select elite winners from top_pool (equivalent to famy.py's select_elite_winners).
+        The top_pool from the miner is our elite winners.
+        """
+        self.elite_winners = top_pool.copy()
+
+        # Update elite memory
+        for elite in self.elite_winners:
+            name = elite.get('name', '')
+            score = elite.get('score', 0.0)
+
+            # Add to cumulative elites if new or improved
+            if name not in self.learning_memory['cumulative_elites'] or \
+               score > self.learning_memory['cumulative_elites'][name].get('score', 0.0):
+                self.learning_memory['cumulative_elites'][name] = {
+                    'score': score,
+                    'round_discovered': self.current_round,
+                    'smiles': elite.get('smiles', ''),
+                    'Target': elite.get('Target', 0.0),
+                    'Anti': elite.get('Anti', 0.0)
+                }
+
+        # Track elite evolution
+        if self.elite_winners:
+            scores = [e.get('score', 0.0) for e in self.elite_winners]
+            self.learning_memory['elite_evolution'].append({
+                'round': self.current_round,
+                'elite_count': len(self.elite_winners),
+                'best_score': max(scores),
+                'mean_score': sum(scores) / len(scores),
+                'min_score': min(scores)
+            })
+
+        bt.logging.info(f"[ProgressiveAmp] Selected {len(self.elite_winners)} elite winners for round {self.current_round}")
+        return True
+
+    def analyze_elite_winner_patterns(self):
+        """
+        Analyze elite winner patterns - extract fingerprints and chemical patterns.
+        Equivalent to famy.py's analyze_elite_winner_patterns.
+        """
+        winner_fingerprints = []
+        winner_substructures = Counter()
+
+        for elite in self.elite_winners:
+            smiles = elite.get('smiles', '')
+            if not smiles:
+                continue
+
+            try:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol is None:
+                    continue
+
+                # Get molecular fingerprint (MACCS like famy.py)
+                fp = MACCSkeys.GenMACCSKeys(mol)
+                winner_fingerprints.append({
+                    'name': elite.get('name', ''),
+                    'score': elite.get('score', 0.0),
+                    'fingerprint': fp,
+                    'smiles': smiles
+                })
+
+                # Extract patterns
+                for pattern_name, pattern_str in CHEMICAL_PATTERNS:
+                    if pattern_str in smiles:
+                        winner_substructures[pattern_name] += 1
+                        # Update cumulative pattern memory
+                        self.learning_memory['cumulative_patterns'][pattern_name] += 1
+
+            except Exception:
+                continue
+
+        # Store analysis results
+        self.elite_winner_patterns = {
+            'fingerprints': winner_fingerprints,
+            'common_substructures': dict(winner_substructures.most_common(20))
+        }
+
+        # Track pattern evolution
+        self.learning_memory['pattern_evolution'].append({
+            'round': self.current_round,
+            'patterns': dict(winner_substructures.most_common(10)),
+            'pattern_diversity': len(winner_substructures),
+            'elite_count': len(winner_fingerprints)
+        })
+
+        bt.logging.info(f"[ProgressiveAmp] Analyzed {len(winner_fingerprints)} elite patterns, "
+                       f"found {len(winner_substructures)} unique patterns")
+        return True
+
+    def reverse_engineer_elite_winners(self):
+        """
+        Reverse engineer elite winners to extract successful reactants.
+        Equivalent to famy.py's reverse_engineer_elite_winners.
+        """
+        winner_reactant_usage = defaultdict(int)
+        reaction_success_rates = defaultdict(list)
+
+        for elite in self.elite_winners:
+            name = elite.get('name', '')
+            score = elite.get('score', 0.0)
+
+            # Parse: "rxn:4:12345:67890" or "rxn:3:111:222:333"
+            parts = name.split(':')
+            if len(parts) >= 4 and parts[0] == 'rxn':
+                try:
+                    rxn_id = int(parts[1])
+                    mol1_id = int(parts[2])
+                    mol2_id = int(parts[3])
+
+                    # Track successful reactants
+                    winner_reactant_usage[mol1_id] += 1
+                    winner_reactant_usage[mol2_id] += 1
+
+                    # Update learning memory for reactants
+                    mem1 = self.learning_memory['successful_reactants_memory'][mol1_id]
+                    old_count1 = mem1['usage_count']
+                    mem1['usage_count'] += 1
+                    mem1['avg_score'] = (mem1['avg_score'] * old_count1 + score) / mem1['usage_count']
+
+                    mem2 = self.learning_memory['successful_reactants_memory'][mol2_id]
+                    old_count2 = mem2['usage_count']
+                    mem2['usage_count'] += 1
+                    mem2['avg_score'] = (mem2['avg_score'] * old_count2 + score) / mem2['usage_count']
+
+                    # For 3-component reactions
+                    if len(parts) >= 5:
+                        mol3_id = int(parts[4])
+                        winner_reactant_usage[mol3_id] += 1
+                        mem3 = self.learning_memory['successful_reactants_memory'][mol3_id]
+                        old_count3 = mem3['usage_count']
+                        mem3['usage_count'] += 1
+                        mem3['avg_score'] = (mem3['avg_score'] * old_count3 + score) / mem3['usage_count']
+
+                    # Track successful reactions
+                    reaction_success_rates[rxn_id].append(score)
+
+                    # Update reaction memory
+                    rxn_mem = self.learning_memory['successful_reactions_memory'][rxn_id]
+                    old_rxn_count = rxn_mem['usage_count']
+                    rxn_mem['usage_count'] += 1
+                    rxn_mem['avg_score'] = (rxn_mem['avg_score'] * old_rxn_count + score) / rxn_mem['usage_count']
+                    rxn_mem['max_score'] = max(rxn_mem['max_score'], score)
+
+                except (ValueError, IndexError):
+                    continue
+
+        # Build successful reactants list with details
+        self.successful_reactants = []
+        for reactant_id, usage_count in winner_reactant_usage.items():
+            # Determine which role this reactant belongs to
+            role_mask = None
+            smiles = None
+            if reactant_id in self.id_to_smiles_A:
+                role_mask = self.roleA
+                smiles = self.id_to_smiles_A[reactant_id]
+            elif reactant_id in self.id_to_smiles_B:
+                role_mask = self.roleB
+                smiles = self.id_to_smiles_B[reactant_id]
+            elif self.is_three_component and reactant_id in self.id_to_smiles_C:
+                role_mask = self.roleC
+                smiles = self.id_to_smiles_C[reactant_id]
+
+            if role_mask and smiles:
+                self.successful_reactants.append({
+                    'mol_id': reactant_id,
+                    'smiles': smiles,
+                    'role_mask': role_mask,
+                    'usage_count': usage_count,
+                    'avg_score': self.learning_memory['successful_reactants_memory'][reactant_id]['avg_score']
+                })
+
+        # Sort by usage count (most used first)
+        self.successful_reactants.sort(key=lambda x: x['usage_count'], reverse=True)
+
+        bt.logging.info(f"[ProgressiveAmp] Reverse engineered {len(self.successful_reactants)} successful reactants")
+        return True
+
+    def find_elite_winner_like_reactants(self, similarity_threshold: float = 0.7):
+        """
+        Find reactants similar to elite winners using fingerprint similarity.
+        Equivalent to famy.py's find_elite_winner_like_reactants.
+        """
+        if not self.elite_winner_patterns.get('fingerprints'):
+            bt.logging.warning("[ProgressiveAmp] No elite winner patterns available")
+            return False
+
+        winner_fps = [w['fingerprint'] for w in self.elite_winner_patterns['fingerprints']]
+        common_patterns = self.elite_winner_patterns.get('common_substructures', {})
+
+        # Use cumulative patterns for better matching after round 1
+        if self.current_round > 1:
+            for pattern, count in self.learning_memory['cumulative_patterns'].most_common(20):
+                if pattern not in common_patterns:
+                    common_patterns[pattern] = count
+
+        self.elite_winner_like_reactants = {'A': [], 'B': [], 'C': []}
+
+        # Search each role
+        role_configs = [
+            ('A', self.molecules_A, self.roleA),
+            ('B', self.molecules_B, self.roleB),
+        ]
+        if self.is_three_component:
+            role_configs.append(('C', self.molecules_C, self.roleC))
+
+        for role_name, molecules, role_mask in role_configs:
+            for mol_id, smiles, _ in molecules:
+                # Get cached fingerprint
+                if mol_id not in self.fingerprint_cache:
+                    continue
+
+                reactant_fp = self.fingerprint_cache[mol_id]
+
+                # Check similarity to elite winner fingerprints
+                max_similarity = 0.0
+                for winner_fp in winner_fps:
+                    try:
+                        similarity = DataStructs.TanimotoSimilarity(reactant_fp, winner_fp)
+                        if similarity > max_similarity:
+                            max_similarity = similarity
+                    except:
+                        continue
+
+                # Memory-guided bonus (key famy.py feature)
+                memory_bonus = 0.0
+                mem_data = self.learning_memory['successful_reactants_memory'].get(mol_id)
+                if mem_data and mem_data['usage_count'] > 0:
+                    memory_bonus = min(mem_data['usage_count'] * 0.05, 0.2)
+
+                # Pattern bonus
+                pattern_bonus = 0.0
+                cached_patterns = self.pattern_cache.get(mol_id, [])
+                for pattern in cached_patterns:
+                    if pattern in common_patterns:
+                        pattern_bonus += PATTERN_BONUSES.get(pattern, 0.02)
+
+                # Combined score
+                combined_score = max_similarity + min(pattern_bonus, 0.3) + memory_bonus
+
+                if combined_score >= similarity_threshold:
+                    self.elite_winner_like_reactants[role_name].append({
+                        'mol_id': mol_id,
+                        'smiles': smiles,
+                        'role_mask': role_mask,
+                        'similarity_score': combined_score,
+                        'fingerprint_similarity': max_similarity,
+                        'pattern_bonus': pattern_bonus,
+                        'memory_bonus': memory_bonus
+                    })
+
+        # Sort by similarity within each role
+        for role_name in self.elite_winner_like_reactants:
+            self.elite_winner_like_reactants[role_name].sort(
+                key=lambda x: x['similarity_score'], reverse=True
+            )
+
+        total_found = sum(len(v) for v in self.elite_winner_like_reactants.values())
+        bt.logging.info(f"[ProgressiveAmp] Found {total_found} elite-winner-like reactants "
+                       f"(A={len(self.elite_winner_like_reactants['A'])}, "
+                       f"B={len(self.elite_winner_like_reactants['B'])}, "
+                       f"C={len(self.elite_winner_like_reactants.get('C', []))})")
+        return total_found > 0
+
+    def generate_progressive_amplification(
+        self,
+        n_samples: int,
+        avoid_names: set,
+        avoid_inchikeys: set,
+        min_heavy_atoms: int = 20,
+        min_rotatable: int = 1,
+        max_rotatable: int = 10,
+        verbose: bool = True
+    ) -> Tuple[List[Dict], Dict]:
+        """
+        Generate molecules using all 4 strategies with memory-enhanced selection.
+        Equivalent to famy.py's generate_elite_targeted_amplification.
+        """
+        candidates = []
+        summary = {
+            'round': self.current_round,
+            'strategies': {},
+            'total_generated': 0
+        }
+
+        # Calculate samples per strategy based on adaptive weights
+        for strategy, weight in self.adaptive_strategy_weights.items():
+            target = int(n_samples * weight)
+            summary['strategies'][strategy] = {'target': target, 'generated': 0}
+
+        if verbose:
+            print(f"[ProgressiveAmp] Round {self.current_round}: Generating {n_samples} candidates", flush=True)
+
+        # Strategy 1: Elite Winner Amplification (50%)
+        target1 = summary['strategies']['elite_winner_amplification']['target']
+        elite_candidates = self._strategy_elite_winner_amplification(target1, avoid_names)
+        summary['strategies']['elite_winner_amplification']['generated'] = len(elite_candidates)
+        candidates.extend(elite_candidates)
+
+        # Strategy 2: Elite Similar Combinations (30%)
+        target2 = summary['strategies']['elite_similar_combinations']['target']
+        similar_candidates = self._strategy_elite_similar_combinations(target2, avoid_names)
+        summary['strategies']['elite_similar_combinations']['generated'] = len(similar_candidates)
+        candidates.extend(similar_candidates)
+
+        # Strategy 3: Successful Reaction Focus (15%)
+        target3 = summary['strategies']['successful_reaction_focus']['target']
+        reaction_candidates = self._strategy_successful_reaction_focus(target3, avoid_names)
+        summary['strategies']['successful_reaction_focus']['generated'] = len(reaction_candidates)
+        candidates.extend(reaction_candidates)
+
+        # Strategy 4: Pattern Guided Exploration (5%)
+        target4 = summary['strategies']['pattern_guided_exploration']['target']
+        pattern_candidates = self._strategy_pattern_guided_exploration(target4, avoid_names)
+        summary['strategies']['pattern_guided_exploration']['generated'] = len(pattern_candidates)
+        candidates.extend(pattern_candidates)
+
+        summary['total_generated'] = len(candidates)
+
+        if verbose:
+            for strategy, stats in summary['strategies'].items():
+                print(f"[ProgressiveAmp]   {strategy}: {stats['generated']}/{stats['target']}", flush=True)
+
+        # Convert to molecule dicts with validation (using molecules.py functions)
+        results = self._validate_and_convert_candidates(
+            candidates, avoid_inchikeys, min_heavy_atoms, min_rotatable, max_rotatable
+        )
+
+        if verbose:
+            print(f"[ProgressiveAmp] Valid molecules: {len(results)}", flush=True)
+
+        return results, summary
+
+    def _strategy_elite_winner_amplification(self, count: int, avoid_names: set) -> List[str]:
+        """
+        Strategy 1: Generate variations using reactants from elite winners.
+        Memory-enhanced: prioritize reactants with high usage counts.
+        """
+        candidates = []
+
+        if not self.successful_reactants:
+            return candidates
+
+        # Group successful reactants by role
+        successful_by_role = {'A': [], 'B': [], 'C': []}
+        for reactant in self.successful_reactants:
+            if reactant['role_mask'] == self.roleA:
+                successful_by_role['A'].append(reactant)
+            elif reactant['role_mask'] == self.roleB:
+                successful_by_role['B'].append(reactant)
+            elif self.is_three_component and reactant['role_mask'] == self.roleC:
+                successful_by_role['C'].append(reactant)
+
+        # Memory-enhanced: sort by usage_count * avg_score (priority score)
+        for role in successful_by_role:
+            successful_by_role[role].sort(
+                key=lambda x: x['usage_count'] * max(x['avg_score'], 0.1),
+                reverse=True
+            )
+
+        reactants_A = successful_by_role['A']
+        reactants_B = successful_by_role['B']
+        reactants_C = successful_by_role['C'] if self.is_three_component else []
+
+        if not reactants_A or not reactants_B:
+            return candidates
+
+        all_A = list(self.id_to_smiles_A.keys())
+        all_B = list(self.id_to_smiles_B.keys())
+        all_C = list(self.id_to_smiles_C.keys()) if self.is_three_component else []
+
+        attempts = 0
+        max_attempts = count * 3
+
+        while len(candidates) < count and attempts < max_attempts:
+            attempts += 1
+
+            # Memory-guided selection: 80% from top performers, 20% random
+            if self.current_round > 1 and random.random() < 0.8:
+                top_A = reactants_A[:min(4, len(reactants_A))]
+                top_B = reactants_B[:min(4, len(reactants_B))]
+                A_id = random.choice(top_A)['mol_id'] if top_A else random.choice([r['mol_id'] for r in reactants_A])
+                B_id = random.choice(top_B)['mol_id'] if top_B else random.choice([r['mol_id'] for r in reactants_B])
+            else:
+                # First round or 20% random: use all successful reactants
+                if reactants_A:
+                    A_id = random.choice([r['mol_id'] for r in reactants_A])
+                else:
+                    A_id = random.choice(all_A)
+                if reactants_B:
+                    B_id = random.choice([r['mol_id'] for r in reactants_B])
+                else:
+                    B_id = random.choice(all_B)
+
+            if self.is_three_component:
+                if self.current_round > 1 and random.random() < 0.8 and reactants_C:
+                    top_C = reactants_C[:min(4, len(reactants_C))]
+                    C_id = random.choice(top_C)['mol_id']
+                elif reactants_C:
+                    C_id = random.choice([r['mol_id'] for r in reactants_C])
+                elif all_C:
+                    C_id = random.choice(all_C)
+                else:
+                    continue
+                combo_key = (self.rxn_id, A_id, B_id, C_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}:{C_id}"
+            else:
+                combo_key = (self.rxn_id, A_id, B_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}"
+
+            if combo_key not in self.used_reactions and name not in avoid_names:
+                self.used_reactions.add(combo_key)
+                candidates.append(name)
+
+        return candidates
+
+    def _strategy_elite_similar_combinations(self, count: int, avoid_names: set) -> List[str]:
+        """
+        Strategy 2: Generate combinations using elite-winner-like reactants.
+        Uses fingerprint similarity to find reactants similar to winners.
+        """
+        candidates = []
+
+        similar_A = self.elite_winner_like_reactants.get('A', [])
+        similar_B = self.elite_winner_like_reactants.get('B', [])
+        similar_C = self.elite_winner_like_reactants.get('C', []) if self.is_three_component else []
+
+        if not similar_A or not similar_B:
+            return candidates
+
+        attempts = 0
+        max_attempts = count * 3
+
+        while len(candidates) < count and attempts < max_attempts:
+            attempts += 1
+
+            # Weight by similarity score for selection
+            A_weights = [r['similarity_score'] for r in similar_A]
+            B_weights = [r['similarity_score'] for r in similar_B]
+
+            A_id = random.choices(similar_A, weights=A_weights, k=1)[0]['mol_id']
+            B_id = random.choices(similar_B, weights=B_weights, k=1)[0]['mol_id']
+
+            if self.is_three_component:
+                if similar_C:
+                    C_weights = [r['similarity_score'] for r in similar_C]
+                    C_id = random.choices(similar_C, weights=C_weights, k=1)[0]['mol_id']
+                elif self.id_to_smiles_C:
+                    C_id = random.choice(list(self.id_to_smiles_C.keys()))
+                else:
+                    continue
+                combo_key = (self.rxn_id, A_id, B_id, C_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}:{C_id}"
+            else:
+                combo_key = (self.rxn_id, A_id, B_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}"
+
+            if combo_key not in self.used_reactions and name not in avoid_names:
+                self.used_reactions.add(combo_key)
+                candidates.append(name)
+
+        return candidates
+
+    def _strategy_successful_reaction_focus(self, count: int, avoid_names: set) -> List[str]:
+        """
+        Strategy 3: Focus on successful reaction type with memory-guided selection.
+        Combines elite reactants with memory-successful ones.
+        """
+        candidates = []
+
+        # Get top successful reactants from memory
+        memory_reactants = []
+        for mol_id, data in self.learning_memory['successful_reactants_memory'].items():
+            if data['usage_count'] > 0:
+                memory_reactants.append((mol_id, data['avg_score'], data['usage_count']))
+
+        memory_reactants.sort(key=lambda x: x[1] * x[2], reverse=True)  # score * usage
+
+        # Separate by role
+        memory_A = [(m, s, c) for m, s, c in memory_reactants if m in self.id_to_smiles_A][:30]
+        memory_B = [(m, s, c) for m, s, c in memory_reactants if m in self.id_to_smiles_B][:30]
+        memory_C = [(m, s, c) for m, s, c in memory_reactants if m in self.id_to_smiles_C][:30] if self.is_three_component else []
+
+        # Extract component IDs from current elite winners
+        elite_A = set()
+        elite_B = set()
+        elite_C = set()
+        for elite in self.elite_winners:
+            parts = elite.get('name', '').split(':')
+            if len(parts) >= 4:
+                try:
+                    elite_A.add(int(parts[2]))
+                    elite_B.add(int(parts[3]))
+                    if len(parts) >= 5:
+                        elite_C.add(int(parts[4]))
+                except:
+                    pass
+
+        # Combine elite and memory
+        combined_A = list(elite_A) + [m[0] for m in memory_A]
+        combined_B = list(elite_B) + [m[0] for m in memory_B]
+        combined_C = list(elite_C) + [m[0] for m in memory_C] if self.is_three_component else []
+
+        if not combined_A:
+            combined_A = list(self.id_to_smiles_A.keys())[:100]
+        if not combined_B:
+            combined_B = list(self.id_to_smiles_B.keys())[:100]
+
+        all_C = list(self.id_to_smiles_C.keys()) if self.is_three_component else []
+
+        attempts = 0
+        max_attempts = count * 3
+
+        while len(candidates) < count and attempts < max_attempts:
+            attempts += 1
+
+            A_id = random.choice(combined_A)
+            B_id = random.choice(combined_B)
+
+            if self.is_three_component:
+                if combined_C:
+                    C_id = random.choice(combined_C)
+                elif all_C:
+                    C_id = random.choice(all_C)
+                else:
+                    continue
+                combo_key = (self.rxn_id, A_id, B_id, C_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}:{C_id}"
+            else:
+                combo_key = (self.rxn_id, A_id, B_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}"
+
+            if combo_key not in self.used_reactions and name not in avoid_names:
+                self.used_reactions.add(combo_key)
+                candidates.append(name)
+
+        return candidates
+
+    def _strategy_pattern_guided_exploration(self, count: int, avoid_names: set) -> List[str]:
+        """
+        Strategy 4: Use chemical patterns and cumulative pattern memory to guide exploration.
+        """
+        candidates = []
+
+        # Find reactants with high-value patterns (using cumulative pattern memory)
+        top_patterns = set(p[0] for p in self.learning_memory['cumulative_patterns'].most_common(15))
+
+        pattern_reactants_A = []
+        pattern_reactants_B = []
+        pattern_reactants_C = []
+
+        for mol_id, patterns in self.pattern_cache.items():
+            if not patterns:
+                continue
+
+            # Score based on pattern bonuses + cumulative pattern frequency
+            pattern_score = 0.0
+            for p in patterns:
+                pattern_score += PATTERN_BONUSES.get(p, 0.0)
+                if p in top_patterns:
+                    pattern_score += 0.1  # Bonus for patterns seen in winners
+
+            if pattern_score >= 0.1:
+                if mol_id in self.id_to_smiles_A:
+                    pattern_reactants_A.append((mol_id, pattern_score))
+                if mol_id in self.id_to_smiles_B:
+                    pattern_reactants_B.append((mol_id, pattern_score))
+                if self.is_three_component and mol_id in self.id_to_smiles_C:
+                    pattern_reactants_C.append((mol_id, pattern_score))
+
+        # Sort by pattern score
+        pattern_reactants_A.sort(key=lambda x: x[1], reverse=True)
+        pattern_reactants_B.sort(key=lambda x: x[1], reverse=True)
+        pattern_reactants_C.sort(key=lambda x: x[1], reverse=True)
+
+        top_A = [m[0] for m in pattern_reactants_A[:50]]
+        top_B = [m[0] for m in pattern_reactants_B[:50]]
+        top_C = [m[0] for m in pattern_reactants_C[:50]] if self.is_three_component else []
+
+        if not top_A:
+            top_A = list(self.id_to_smiles_A.keys())[:50]
+        if not top_B:
+            top_B = list(self.id_to_smiles_B.keys())[:50]
+        if self.is_three_component and not top_C:
+            top_C = list(self.id_to_smiles_C.keys())[:50]
+
+        attempts = 0
+        max_attempts = count * 3
+
+        while len(candidates) < count and attempts < max_attempts:
+            attempts += 1
+
+            A_id = random.choice(top_A)
+            B_id = random.choice(top_B)
+
+            if self.is_three_component:
+                if top_C:
+                    C_id = random.choice(top_C)
+                else:
+                    continue
+                combo_key = (self.rxn_id, A_id, B_id, C_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}:{C_id}"
+            else:
+                combo_key = (self.rxn_id, A_id, B_id)
+                name = f"rxn:{self.rxn_id}:{A_id}:{B_id}"
+
+            if combo_key not in self.used_reactions and name not in avoid_names:
+                self.used_reactions.add(combo_key)
+                candidates.append(name)
+
+        return candidates
+
+    def _validate_and_convert_candidates(
+        self,
+        candidates: List[str],
+        avoid_inchikeys: set,
+        min_heavy_atoms: int = 20,
+        min_rotatable: int = 1,
+        max_rotatable: int = 10
+    ) -> List[Dict]:
+        """Validate candidates and convert to molecule dicts (using molecules.py functions)."""
+        results = []
+
+        for name in candidates:
+            # Use molecules.py's cached SMILES retrieval
+            smiles = _get_smiles_from_reaction_cached(name)
+            if not smiles:
+                continue
+
+            # Property filters (using molecules.py functions)
+            heavy = get_heavy_atom_count(smiles)
+            if heavy < min_heavy_atoms:
+                continue
+
+            rotatable = num_rotatable_bonds(smiles)
+            if rotatable < min_rotatable or rotatable > max_rotatable:
+                continue
+
+            # Generate InChIKey (using molecules.py function)
+            inchikey = generate_inchikey(smiles)
+            if not inchikey or inchikey in avoid_inchikeys:
+                continue
+
+            results.append({
+                'name': name,
+                'smiles': smiles,
+                'InChIKey': inchikey
+            })
+
+        return results
+
+    def update_learning_memory_with_results(self, scored_molecules: List[Dict]):
+        """
+        Update learning memory with scored results from this round.
+        Equivalent to famy.py's update_learning_memory_with_round_results.
+
+        Call this AFTER scoring to update memory for next round.
+
+        Args:
+            scored_molecules: List of dicts with 'name', 'smiles', 'score', 'Target', 'Anti'
+        """
+        if not scored_molecules:
+            return
+
+        scores = [m.get('score', 0.0) for m in scored_molecules]
+
+        # Update all discovered molecules
+        for mol in scored_molecules:
+            name = mol.get('name', '')
+            self.learning_memory['all_discovered_molecules'][name] = {
+                'score': mol.get('score', 0.0),
+                'Target': mol.get('Target', 0.0),
+                'Anti': mol.get('Anti', 0.0),
+                'round_discovered': self.current_round
+            }
+
+        # Calculate round performance metrics
+        round_stats = {
+            'round': self.current_round,
+            'molecules_generated': len(scores),
+            'best_score': max(scores) if scores else 0.0,
+            'mean_score': sum(scores) / len(scores) if scores else 0.0,
+            'improvement_from_previous': 0.0
+        }
+
+        # Calculate improvement from previous round
+        if self.learning_memory['round_performance']:
+            prev_best = self.learning_memory['round_performance'][-1]['best_score']
+            round_stats['improvement_from_previous'] = round_stats['best_score'] - prev_best
+
+        self.learning_memory['round_performance'].append(round_stats)
+
+        # Update convergence metrics
+        if round_stats['improvement_from_previous'] < self.learning_memory['convergence_metrics']['improvement_threshold']:
+            self.learning_memory['convergence_metrics']['rounds_without_improvement'] += 1
+        else:
+            self.learning_memory['convergence_metrics']['rounds_without_improvement'] = 0
+
+        if round_stats['best_score'] > self.learning_memory['convergence_metrics']['best_score_ever']:
+            self.learning_memory['convergence_metrics']['best_score_ever'] = round_stats['best_score']
+            self.learning_memory['convergence_metrics']['best_score_round'] = self.current_round
+
+        bt.logging.info(f"[ProgressiveAmp] Round {self.current_round} memory updated: "
+                       f"best={round_stats['best_score']:.4f}, "
+                       f"mean={round_stats['mean_score']:.4f}, "
+                       f"improvement={round_stats['improvement_from_previous']:+.4f}")
+
+
+def run_progressive_amplification(
+    amp_state: ProgressiveAmplificationState,
+    top_pool: List[Dict],
+    n_samples: int = 3000,
+    avoid_names: set = None,
+    avoid_inchikeys: set = None,
+    similarity_threshold: float = 0.7,
+    min_heavy_atoms: int = 20,
+    min_rotatable: int = 1,
+    max_rotatable: int = 10,
+    verbose: bool = True
+) -> Tuple[List[Dict], Dict]:
+    """
+    Run one round of progressive amplification.
+
+    This is the main entry point for amplification mode in the miner.
+    Uses the full famy.py progressive learning approach.
+
+    Args:
+        amp_state: ProgressiveAmplificationState instance (persists across rounds)
+        top_pool: Current top 100 molecules as list of dicts
+        n_samples: Target number of molecules to generate
+        avoid_names: Set of molecule names to avoid
+        avoid_inchikeys: Set of InChIKeys to avoid
+        similarity_threshold: Threshold for finding similar reactants
+        min_heavy_atoms: Minimum heavy atom count
+        min_rotatable: Minimum rotatable bonds
+        max_rotatable: Maximum rotatable bonds
+        verbose: Print progress
+
+    Returns:
+        (list of molecule dicts, summary dict)
+    """
+    if avoid_names is None:
+        avoid_names = set()
+    if avoid_inchikeys is None:
+        avoid_inchikeys = set()
+
+    # Increment round
+    amp_state.current_round += 1
+
+    if verbose:
+        print(f"[ProgressiveAmp] === Round {amp_state.current_round} ===", flush=True)
+
+    # Step 1: Select elite winners (top pool = elite winners)
+    amp_state.select_elite_winners(top_pool)
+
+    # Step 2: Analyze elite winner patterns
+    amp_state.analyze_elite_winner_patterns()
+
+    # Step 3: Reverse engineer elite winners to extract successful reactants
+    amp_state.reverse_engineer_elite_winners()
+
+    # Step 4: Find elite-winner-like reactants
+    amp_state.find_elite_winner_like_reactants(similarity_threshold)
+
+    # Step 5: Generate using all 4 strategies with memory enhancement
+    results, summary = amp_state.generate_progressive_amplification(
+        n_samples=n_samples,
+        avoid_names=avoid_names,
+        avoid_inchikeys=avoid_inchikeys,
+        min_heavy_atoms=min_heavy_atoms,
+        min_rotatable=min_rotatable,
+        max_rotatable=max_rotatable,
+        verbose=verbose
+    )
+
+    if verbose:
+        print(f"[ProgressiveAmp] Round {amp_state.current_round}: Generated {len(results)} valid molecules", flush=True)
+
+    return results, summary

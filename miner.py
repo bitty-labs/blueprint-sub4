@@ -36,7 +36,13 @@ from molecules import (
     compute_diverse_components,
     generate_diverse_molecules,
     run_amplification,
+    # v12: Progressive amplification (full famy.py approach)
+    ProgressiveAmplificationState,
+    run_progressive_amplification,
 )
+
+# v12: Region-based sampling (anti-dominant strategy)
+from regions import RegionBasedSampler
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
@@ -228,15 +234,21 @@ def main(config: dict):
     # Enhanced first iteration - good exploration
     n_samples_first_iteration = base_n_samples * 4 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 2
 
-    # Mode tracking - iterations 1-9: GA/Synthon, 10-34: Amplification (25 rounds), 35+: Exploit
-    amplification_start_iteration = 10
-    exploit_start_iteration = 35
+    # Mode tracking - iterations 1-17: GA/Synthon, 18-21: Exploit, 22+: Progressive Amplification
+    exploit_start_iteration = 18
+    exploit_end_iteration = 21
+    amplification_start_iteration = 22
+    amplification_end_iteration = 999  # runs until end
     use_amplification_mode = False
     use_exploit_mode = False
     seen_names = set()  # Track all molecule names for exploit/amplification
     exploited_reactants = set()  # Track which reactants have been exploited
     amplification_rounds = 0  # Track amplification iteration count
-    print(f"[Miner] Entering main loop (amplification at iter {amplification_start_iteration}, exploit at iter {exploit_start_iteration})...", flush=True)
+
+    # v12: Progressive amplification state (persists across rounds, like famy.py)
+    progressive_amp_state = None
+
+    print(f"[Miner] Entering main loop (region iter 1-2, synthon 3-17, exploit {exploit_start_iteration}-{exploit_end_iteration}, progressive amplification {amplification_start_iteration}+)...", flush=True)
 
     # Use single CPU worker - proven pattern reduces overhead, improves stability
     with ProcessPoolExecutor(max_workers=2) as cpu_executor:
@@ -245,20 +257,30 @@ def main(config: dict):
             iter_start_time = time.time()
             print(f"[Miner] === Starting iteration {iteration} ===", flush=True)
 
-            # Switch to amplification mode at iteration 10
-            if iteration >= amplification_start_iteration and not use_amplification_mode and not use_exploit_mode:
-                use_amplification_mode = True
-                seen_names = set(top_pool["name"].tolist())
-                bt.logging.info(f"[Miner] Switching to AMPLIFICATION MODE at iteration {iteration}")
-                print(f"[Miner] Switching to AMPLIFICATION MODE at iteration {iteration}", flush=True)
-
-            # Switch to exploit mode at iteration 20 (after 10 amplification rounds)
-            if iteration >= exploit_start_iteration and not use_exploit_mode:
+            # Switch to exploit mode at iteration 15-20
+            if iteration >= exploit_start_iteration and iteration <= exploit_end_iteration and not use_exploit_mode:
                 use_exploit_mode = True
-                use_amplification_mode = False  # Turn off amplification
+                use_amplification_mode = False
                 seen_names = set(top_pool["name"].tolist())
                 bt.logging.info(f"[Miner] Switching to EXPLOIT MODE at iteration {iteration}")
                 print(f"[Miner] Switching to EXPLOIT MODE at iteration {iteration}", flush=True)
+
+            # Switch to progressive amplification mode at iteration 21+
+            if iteration >= amplification_start_iteration and not use_amplification_mode:
+                use_amplification_mode = True
+                use_exploit_mode = False  # Turn off exploit
+                seen_names = set(top_pool["name"].tolist())
+
+                # v12: Initialize ProgressiveAmplificationState (famy.py approach)
+                try:
+                    progressive_amp_state = ProgressiveAmplificationState(DB_PATH, rxn_id)
+                    bt.logging.info(f"[Miner] Initialized ProgressiveAmplificationState for rxn:{rxn_id}")
+                except Exception as e:
+                    bt.logging.error(f"[Miner] Failed to initialize ProgressiveAmplificationState: {e}")
+                    progressive_amp_state = None
+
+                bt.logging.info(f"[Miner] Switching to PROGRESSIVE AMPLIFICATION MODE at iteration {iteration}")
+                print(f"[Miner] Switching to PROGRESSIVE AMPLIFICATION MODE at iteration {iteration}", flush=True)
 
             # Adaptive n_samples: maintain good throughput
             remaining_time = 1800 - (time.time() - start)
@@ -369,40 +391,57 @@ def main(config: dict):
                             component_weights=component_weights,
                         )
 
-            # AMPLIFICATION MODE: Use elite winner pattern amplification (iterations 10-19)
+            # AMPLIFICATION MODE: Use PROGRESSIVE elite winner pattern amplification (famy.py approach)
             elif use_amplification_mode and not top_pool.empty:
                 amplification_rounds += 1
 
                 # Different sample counts based on reaction type
-                # 3-component reactions (rxn 3, 5): 3000 samples, 70 elites
-                # 2-component reactions (rxn 1, 2, 4): 700 samples, 40 elites
+                # 3-component reactions (rxn 3, 5): 4500 samples, 100 elites
+                # 2-component reactions (rxn 1, 2, 4): 1500 samples, 100 elites
                 is_3_component = rxn_id in [3, 5]
-                amp_n_samples = 3000 if is_3_component else 700
-                amp_elite_count = 70 if is_3_component else 40
+                amp_n_samples = 4500 if is_3_component else 1500
+                amp_elite_count = 100
 
-                bt.logging.info(f"[Miner] Iteration {iteration}: AMPLIFICATION MODE (round {amplification_rounds}, n_samples={amp_n_samples}, elites={amp_elite_count})")
-                print(f"[Miner] Iteration {iteration}: Running AMPLIFICATION (round {amplification_rounds}, {'3-comp' if is_3_component else '2-comp'}, n={amp_n_samples}, elites={amp_elite_count})...", flush=True)
+                bt.logging.info(f"[Miner] Iteration {iteration}: PROGRESSIVE AMPLIFICATION (round {amplification_rounds}, n_samples={amp_n_samples}, elites={amp_elite_count})")
+                print(f"[Miner] Iteration {iteration}: Running PROGRESSIVE AMPLIFICATION (round {amplification_rounds}, {'3-comp' if is_3_component else '2-comp'}, n={amp_n_samples}, elites={amp_elite_count})...", flush=True)
 
                 # Convert top_pool to list of dicts for amplification
                 top_mols = top_pool.head(amp_elite_count).to_dict("records")
 
                 amp_start = time.time()
                 try:
-                    amp_results, amp_summary = run_amplification(
-                        top_molecules=top_mols,
-                        db_path=DB_PATH,
-                        rxn_id=rxn_id,
-                        n_samples=amp_n_samples,  # Adjusted for reaction type
-                        avoid_names=seen_names,
-                        avoid_inchikeys=seen_inchikeys,
-                        min_heavy_atoms=config.get('min_heavy_atoms', 20),
-                        min_rotatable=config.get('min_rotatable_bonds', 1),
-                        max_rotatable=config.get('max_rotatable_bonds', 10),
-                        verbose=True
-                    )
+                    # v12: Use progressive amplification (famy.py approach with memory)
+                    if progressive_amp_state is not None:
+                        amp_results, amp_summary = run_progressive_amplification(
+                            amp_state=progressive_amp_state,
+                            top_pool=top_mols,
+                            n_samples=amp_n_samples,
+                            avoid_names=seen_names,
+                            avoid_inchikeys=seen_inchikeys,
+                            similarity_threshold=0.7,
+                            min_heavy_atoms=config.get('min_heavy_atoms', 20),
+                            min_rotatable=config.get('min_rotatable_bonds', 1),
+                            max_rotatable=config.get('max_rotatable_bonds', 10),
+                            verbose=True
+                        )
+                    else:
+                        # Fallback to old amplification if state not initialized
+                        bt.logging.warning("[Miner] ProgressiveAmplificationState not available, using fallback")
+                        amp_results, amp_summary = run_amplification(
+                            top_molecules=top_mols,
+                            db_path=DB_PATH,
+                            rxn_id=rxn_id,
+                            n_samples=amp_n_samples,
+                            avoid_names=seen_names,
+                            avoid_inchikeys=seen_inchikeys,
+                            min_heavy_atoms=config.get('min_heavy_atoms', 20),
+                            min_rotatable=config.get('min_rotatable_bonds', 1),
+                            max_rotatable=config.get('max_rotatable_bonds', 10),
+                            verbose=True
+                        )
 
                     amp_time = time.time() - amp_start
-                    bt.logging.info(f"[Miner] Amplification returned {len(amp_results)} candidates in {amp_time:.1f}s")
+                    bt.logging.info(f"[Miner] Progressive Amplification returned {len(amp_results)} candidates in {amp_time:.1f}s")
 
                     if amp_results:
                         data = pd.DataFrame(amp_results)
@@ -412,7 +451,7 @@ def main(config: dict):
                         for strategy, stats in amp_summary.get('strategies', {}).items():
                             bt.logging.info(f"[Miner]   {strategy}: {stats.get('generated', 0)} generated")
                     else:
-                        bt.logging.warning(f"[Miner] Amplification returned no results, falling back to GA")
+                        bt.logging.warning(f"[Miner] Progressive Amplification returned no results, falling back to GA")
                         data = generate_valid_random_molecules_batch(
                             rxn_id,
                             n_samples=n_samples,
@@ -427,7 +466,7 @@ def main(config: dict):
                         )
 
                 except Exception as e:
-                    bt.logging.error(f"[Miner] Amplification failed: {e}")
+                    bt.logging.error(f"[Miner] Progressive Amplification failed: {e}")
                     print_exc()
                     data = generate_valid_random_molecules_batch(
                         rxn_id,
@@ -442,53 +481,67 @@ def main(config: dict):
                         component_weights=component_weights,
                     )
 
-            # WINNING STRATEGY: Intelligent exploration/exploitation balance (iterations 1-9)
+            # v12: REGION-BASED SAMPLING (anti-dominant strategy)
+            # Instead of Tanimoto diversity, sample from underexplored feature regions
             elif iteration == 1:
-                print(f"[Miner] Iteration 1: DIVERSITY SAMPLING for rxn:{rxn_id}...", flush=True)
-                bt.logging.info(f"[Miner] Iteration {iteration}: Diversity-enforced exploration")
+                print(f"[Miner] Iteration 1: REGION-BASED SAMPLING for rxn:{rxn_id}...", flush=True)
+                bt.logging.info(f"[Miner] Iteration {iteration}: Region-based anti-dominant exploration")
 
-                # Step 1: Compute diverse component subsets using matrix Tanimoto
                 try:
-                    diverse_start = time.time()
-                    diverse_components = compute_diverse_components(
-                        db_path=DB_PATH,
-                        rxn_id=rxn_id,
-                        n_per_pool=60,  # 60 diverse components per pool
-                        max_similarity=0.15  # Components must be < 0.15 similar (very diverse)
-                    )
-                    diverse_time = time.time() - diverse_start
-                    bt.logging.info(f"[Miner] Diverse components computed in {diverse_time:.1f}s")
+                    region_start = time.time()
 
-                    # Step 2: Generate molecules from diverse combinations
-                    data = generate_diverse_molecules(
-                        rxn_id=rxn_id,
-                        diverse_components=diverse_components,
-                        n_samples=n_samples_first_iteration,
-                        subnet_config=config,
-                        avoid_inchikeys=seen_inchikeys
-                    )
+                    # Build region sampler (maps components to feature regions)
+                    region_sampler = RegionBasedSampler(DB_PATH, rxn_id)
 
-                    if len(data) < n_samples_first_iteration // 2:
-                        # Not enough diverse molecules, supplement with random
-                        bt.logging.warning(f"[Miner] Only {len(data)} diverse molecules, adding random...")
-                        n_supplement = n_samples_first_iteration - len(data)
-                        supplement_df = generate_valid_random_molecules_batch(
-                            rxn_id,
-                            n_samples=n_supplement,
-                            db_path=DB_PATH,
-                            subnet_config=config,
-                            batch_size=400,
-                            elite_names=None,
-                            elite_frac=0.0,
-                            mutation_prob=1.0,
-                            avoid_inchikeys=seen_inchikeys.union(set(data["InChIKey"].tolist())),
-                            component_weights=None,
+                    # Log region statistics
+                    stats = region_sampler.get_region_stats()
+                    for pool_name, pool_stats in stats.get('pools', {}).items():
+                        bt.logging.info(
+                            f"[Miner] Pool {pool_name}: {pool_stats['total']} mols, "
+                            f"rare={pool_stats['n_rare']}, uncommon={pool_stats['n_uncommon']}, "
+                            f"common={pool_stats['n_common']}, dominant={pool_stats['n_dominant']}"
                         )
-                        data = pd.concat([data, supplement_df], ignore_index=True)
-                        data = data.drop_duplicates(subset=["InChIKey"], keep="first")
+                        # Log dominant regions (what we're avoiding)
+                        for dom_region, dom_count in pool_stats.get('dominant_regions', []):
+                            bt.logging.info(f"[Miner]   AVOIDING dominant: {dom_region} ({dom_count} mols)")
+
+                    # Generate molecules using stratified region sampling
+                    # Distribution: 40% rare, 35% uncommon, 25% common, 0% dominant
+                    region_molecules = region_sampler.generate_region_stratified_molecules(
+                        n_samples=n_samples_first_iteration,
+                        rare_pct=0.40,
+                        uncommon_pct=0.35,
+                        common_pct=0.25,
+                        avoid_inchikeys=seen_inchikeys,
+                        subnet_config=config
+                    )
+
+                    region_time = time.time() - region_start
+                    bt.logging.info(f"[Miner] Region sampling generated {len(region_molecules)} molecules in {region_time:.1f}s")
+
+                    if region_molecules:
+                        data = pd.DataFrame(region_molecules)
+                    else:
+                        data = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+
+                    # If not enough, supplement with anti-dominant sampling
+                    if len(data) < n_samples_first_iteration // 2:
+                        bt.logging.warning(f"[Miner] Only {len(data)} region molecules, adding anti-dominant...")
+                        n_supplement = n_samples_first_iteration - len(data)
+
+                        supplement_molecules = region_sampler.generate_anti_dominant_molecules(
+                            n_samples=n_supplement,
+                            avoid_inchikeys=seen_inchikeys.union(set(data["InChIKey"].tolist())),
+                            subnet_config=config
+                        )
+
+                        if supplement_molecules:
+                            supplement_df = pd.DataFrame(supplement_molecules)
+                            data = pd.concat([data, supplement_df], ignore_index=True)
+                            data = data.drop_duplicates(subset=["InChIKey"], keep="first")
 
                 except Exception as e:
-                    bt.logging.error(f"[Miner] Diversity sampling failed: {e}, falling back to random")
+                    bt.logging.error(f"[Miner] Region sampling failed: {e}, falling back to random")
                     print_exc()
                     data = generate_valid_random_molecules_batch(
                         rxn_id,
@@ -501,6 +554,70 @@ def main(config: dict):
                         mutation_prob=1.0,
                         avoid_inchikeys=seen_inchikeys,
                         component_weights=None,
+                    )
+
+            # v12: Iteration 2 - Second round of region exploration with different focus
+            elif iteration == 2:
+                print(f"[Miner] Iteration 2: REGION-BASED + GA HYBRID for rxn:{rxn_id}...", flush=True)
+                bt.logging.info(f"[Miner] Iteration {iteration}: Region-based exploration (uncommon focus)")
+
+                try:
+                    # Reuse or rebuild region sampler
+                    region_sampler = RegionBasedSampler(DB_PATH, rxn_id)
+
+                    # Second round: More focus on uncommon regions (adjacent to successful rare)
+                    # Distribution: 25% rare, 45% uncommon, 30% common, 0% dominant
+                    region_molecules = region_sampler.generate_region_stratified_molecules(
+                        n_samples=n_samples,
+                        rare_pct=0.25,
+                        uncommon_pct=0.45,
+                        common_pct=0.30,
+                        avoid_inchikeys=seen_inchikeys,
+                        subnet_config=config
+                    )
+
+                    bt.logging.info(f"[Miner] Region sampling (iter 2) generated {len(region_molecules)} molecules")
+
+                    if region_molecules:
+                        region_df = pd.DataFrame(region_molecules)
+                    else:
+                        region_df = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
+
+                    # Supplement with GA if needed
+                    if len(region_df) < n_samples // 2:
+                        n_supplement = n_samples - len(region_df)
+                        bt.logging.info(f"[Miner] Supplementing with {n_supplement} GA molecules")
+                        ga_df = generate_valid_random_molecules_batch(
+                            rxn_id,
+                            n_samples=n_supplement,
+                            db_path=DB_PATH,
+                            subnet_config=config,
+                            batch_size=400,
+                            elite_names=elite_names,
+                            elite_frac=elite_frac,
+                            mutation_prob=mutation_prob,
+                            avoid_inchikeys=seen_inchikeys.union(set(region_df["InChIKey"].tolist())),
+                            component_weights=component_weights,
+                        )
+                        data = pd.concat([region_df, ga_df], ignore_index=True)
+                        data = data.drop_duplicates(subset=["InChIKey"], keep="first")
+                    else:
+                        data = region_df
+
+                except Exception as e:
+                    bt.logging.error(f"[Miner] Region sampling (iter 2) failed: {e}, using GA")
+                    print_exc()
+                    data = generate_valid_random_molecules_batch(
+                        rxn_id,
+                        n_samples=n_samples,
+                        db_path=DB_PATH,
+                        subnet_config=config,
+                        batch_size=400,
+                        elite_names=elite_names,
+                        elite_frac=elite_frac,
+                        mutation_prob=mutation_prob,
+                        avoid_inchikeys=seen_inchikeys,
+                        component_weights=component_weights,
                     )
 
             elif use_synthon_search and iteration > 2 and not top_pool.empty:
@@ -880,6 +997,14 @@ def main(config: dict):
                 top_pool = pd.concat([top_pool, total_data], ignore_index=True)
                 top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
                 top_pool = top_pool.sort_values(by="score", ascending=False)
+
+                # v12: Update progressive amplification memory with scored results
+                if use_amplification_mode and progressive_amp_state is not None:
+                    try:
+                        scored_mols = total_data.to_dict("records")
+                        progressive_amp_state.update_learning_memory_with_results(scored_mols)
+                    except Exception as e:
+                        bt.logging.warning(f"[Miner] Failed to update progressive amp memory: {e}")
             else:
                 bt.logging.warning(f"[Miner] Iteration {iteration}: No valid scored data to add to pool")
 
