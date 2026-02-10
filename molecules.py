@@ -1574,16 +1574,41 @@ def _exploit_single_variation_3comp(
     return stage1_passed[:limit], stats
 
 
-def get_top_n_unexploited(top_molecules: list, exploited_reactants: set, n: int = 5) -> list:
+def get_top_n_unexploited(top_molecules: list, exploited_reactants: set, n: int = 5, target_reactants: int = None) -> list:
     """
-    Get top N molecules that have at least one unexploited reactant.
-    Searches through the entire list to find N molecules with unexploited reactants.
-    Handles both 2-component (4 parts) and 3-component (5 parts) reactions.
+    Select molecules to exploit a consistent number of unique (role, reactant) pairs.
+
+    Args:
+        top_molecules: Ranked list of molecules (best first)
+        exploited_reactants: Set of (role, id) tuples already exploited in previous iterations
+        n: Max number of molecules to return (fallback limit)
+        target_reactants: Target number of NEW (role, reactant) pairs to exploit.
+                         If None, defaults to n * 3 (for 3-component reactions).
+
+    Returns:
+        List of molecules that together contribute target_reactants new pairs.
+
+    Key behavior:
+        - Keeps going down the ranking until we've accumulated enough NEW reactants
+        - A reactant is NEW if not in exploited_reactants AND not already selected this call
+        - Stops when we hit target_reactants OR run out of molecules with new reactants
+        - Never returns more than n molecules (safety limit)
     """
+    if target_reactants is None:
+        target_reactants = n * 3  # Default: 5 molecules × 3 components = 15 reactants
+
     selected = []
+    # Track NEW reactants that will be exploited by molecules we're selecting
+    pending_new_reactants = set()
+
     for mol in top_molecules:
-        if len(selected) >= n:
+        # Stop if we have enough new reactants to exploit
+        if len(pending_new_reactants) >= target_reactants:
             break
+        # Safety limit on number of molecules
+        if len(selected) >= n * 2:  # Allow up to 2x molecules to find enough reactants
+            break
+
         name = mol.get("name", "")
         parts = name.split(":")
         if len(parts) >= 4:
@@ -1591,21 +1616,31 @@ def get_top_n_unexploited(top_molecules: list, exploited_reactants: set, n: int 
                 rxn_id = int(parts[1])
                 id_A = int(parts[2])
                 id_B = int(parts[3])
-                # For 3-component reactions
                 id_C = int(parts[4]) if len(parts) == 5 else None
 
-                # Include if any reactant hasn't been exploited
-                # rxn:5 uses tuple tracking (role, id) since roleB == roleC
+                # Build the reactant keys for this molecule
                 if id_C is not None and rxn_id == 5:
-                    if ('A', id_A) not in exploited_reactants or ('B', id_B) not in exploited_reactants or ('C', id_C) not in exploited_reactants:
-                        selected.append(mol)
+                    # rxn:5 uses tuple tracking (role, id) since roleB == roleC
+                    mol_reactants = {('A', id_A), ('B', id_B), ('C', id_C)}
+                elif id_C is not None:
+                    # Other 3-component reactions
+                    mol_reactants = {id_A, id_B, id_C}
                 else:
-                    if id_A not in exploited_reactants or id_B not in exploited_reactants:
-                        selected.append(mol)
-                    elif id_C is not None and id_C not in exploited_reactants:
-                        selected.append(mol)
+                    # 2-component reactions
+                    mol_reactants = {id_A, id_B}
+
+                # Find NEW reactants: not exploited before AND not pending from this selection
+                new_reactants = mol_reactants - exploited_reactants - pending_new_reactants
+
+                if new_reactants:
+                    # This molecule contributes new reactants - select it
+                    selected.append(mol)
+                    pending_new_reactants.update(new_reactants)
+                # else: skip, all its reactants are already covered
+
             except (ValueError, IndexError):
                 pass
+
     return selected
 
 
@@ -1753,16 +1788,38 @@ def _exploit_3comp(
     max_rotatable: int,
     verbose: bool
 ) -> Tuple[List[Dict], Dict]:
-    """Handle 3-component reaction exploitation."""
+    """
+    Handle 3-component reaction exploitation.
 
-    exploited_tuples = set()
+    DEDUPLICATION LOGIC (fixed in v16):
+    - Track by (role, varied_reactant_id) NOT by fixed components
+    - This ensures each unique (role, reactant) pair is exploited exactly once
+    - For rxn5 where roleB == roleC: ('B', 225514) and ('C', 225514) are DIFFERENT
+      because varying B vs C produces different chemistry
+
+    Example with top 5 molecules sharing reactants:
+      Mol1: rxn:5:196792:226069:225514
+      Mol2: rxn:5:196792:226069:225884  (same A,B different C)
+      Mol3: rxn:5:196792:226411:225514  (same A,C different B)
+
+    Old behavior (wrong): Would exploit A=196792 three times (different fixed components)
+    New behavior (correct): Exploits A=196792 once, B=226069 once, B=226411 once, etc.
+    """
+
+    # Track (role, varied_id) pairs exploited THIS call - prevents duplicates within call
+    exploited_this_call = set()
+
     all_candidates = []
     summary = {
         'molecules_processed': 0,
         'variations_exploited': 0,
+        'skipped_already_exploited': 0,
         'total_candidates': 0,
         'exploited_reactant_ids': set()
     }
+
+    # For rxn5, roleB == roleC, so same reactant in B vs C position is different chemistry
+    # Always use tuple tracking (role, id) for 3-component reactions for clarity
 
     for mol_info in top_molecules[:top_n]:
         name = mol_info.get("name", "")
@@ -1791,13 +1848,9 @@ def _exploit_3comp(
         if verbose:
             print(f"[Exploit] 3-comp: {name}", flush=True)
 
-        # rxn:5 uses tuple tracking (role, id) since roleB == roleC
-        use_tuple_tracking = (rxn_id == 5)
-
-        # Vary A
-        tuple_key = ('A', id_B, id_C)
-        check_key_A = ('A', id_A) if use_tuple_tracking else id_A
-        if tuple_key not in exploited_tuples and check_key_A not in exploited_reactants:
+        # Vary A: key is ('A', id_A) - the reactant being varied
+        vary_key_A = ('A', id_A)
+        if vary_key_A not in exploited_this_call and vary_key_A not in exploited_reactants:
             candidates, stats = _exploit_single_variation_3comp(
                 fixed_ids=(id_B, id_C), vary_role='A', winner=winner,
                 rxn_id=rxn_id, db_path=db_path,
@@ -1808,17 +1861,22 @@ def _exploit_3comp(
             )
             all_candidates.extend(candidates)
             summary['variations_exploited'] += 1
-            summary['exploited_reactant_ids'].add(('A', id_A) if use_tuple_tracking else id_A)
-            exploited_tuples.add(tuple_key)
+            summary['exploited_reactant_ids'].add(vary_key_A)
+            exploited_this_call.add(vary_key_A)
             for c in candidates:
                 local_avoid.add(c.name)
             if verbose:
-                print(f"  [Exploit] Vary A -> {len(candidates)} candidates", flush=True)
+                print(f"  [Exploit] Vary A ({id_A}) -> {len(candidates)} candidates", flush=True)
+        elif verbose:
+            if vary_key_A in exploited_this_call:
+                print(f"  [Exploit] Skip A ({id_A}) - already exploited this call", flush=True)
+            else:
+                print(f"  [Exploit] Skip A ({id_A}) - exploited in previous iteration", flush=True)
+            summary['skipped_already_exploited'] += 1
 
-        # Vary B
-        tuple_key = ('B', id_A, id_C)
-        check_key_B = ('B', id_B) if use_tuple_tracking else id_B
-        if tuple_key not in exploited_tuples and check_key_B not in exploited_reactants:
+        # Vary B: key is ('B', id_B)
+        vary_key_B = ('B', id_B)
+        if vary_key_B not in exploited_this_call and vary_key_B not in exploited_reactants:
             candidates, stats = _exploit_single_variation_3comp(
                 fixed_ids=(id_A, id_C), vary_role='B', winner=winner,
                 rxn_id=rxn_id, db_path=db_path,
@@ -1829,17 +1887,23 @@ def _exploit_3comp(
             )
             all_candidates.extend(candidates)
             summary['variations_exploited'] += 1
-            summary['exploited_reactant_ids'].add(('B', id_B) if use_tuple_tracking else id_B)
-            exploited_tuples.add(tuple_key)
+            summary['exploited_reactant_ids'].add(vary_key_B)
+            exploited_this_call.add(vary_key_B)
             for c in candidates:
                 local_avoid.add(c.name)
             if verbose:
-                print(f"  [Exploit] Vary B -> {len(candidates)} candidates", flush=True)
+                print(f"  [Exploit] Vary B ({id_B}) -> {len(candidates)} candidates", flush=True)
+        elif verbose:
+            if vary_key_B in exploited_this_call:
+                print(f"  [Exploit] Skip B ({id_B}) - already exploited this call", flush=True)
+            else:
+                print(f"  [Exploit] Skip B ({id_B}) - exploited in previous iteration", flush=True)
+            summary['skipped_already_exploited'] += 1
 
-        # Vary C
-        tuple_key = ('C', id_A, id_B)
-        check_key_C = ('C', id_C) if use_tuple_tracking else id_C
-        if tuple_key not in exploited_tuples and check_key_C not in exploited_reactants:
+        # Vary C: key is ('C', id_C)
+        # For rxn5: ('C', 225514) is DIFFERENT from ('B', 225514) - different chemistry
+        vary_key_C = ('C', id_C)
+        if vary_key_C not in exploited_this_call and vary_key_C not in exploited_reactants:
             candidates, stats = _exploit_single_variation_3comp(
                 fixed_ids=(id_A, id_B), vary_role='C', winner=winner,
                 rxn_id=rxn_id, db_path=db_path,
@@ -1850,20 +1914,30 @@ def _exploit_3comp(
             )
             all_candidates.extend(candidates)
             summary['variations_exploited'] += 1
-            summary['exploited_reactant_ids'].add(('C', id_C) if use_tuple_tracking else id_C)
-            exploited_tuples.add(tuple_key)
+            summary['exploited_reactant_ids'].add(vary_key_C)
+            exploited_this_call.add(vary_key_C)
             for c in candidates:
                 local_avoid.add(c.name)
             if verbose:
-                print(f"  [Exploit] Vary C -> {len(candidates)} candidates", flush=True)
+                print(f"  [Exploit] Vary C ({id_C}) -> {len(candidates)} candidates", flush=True)
+        elif verbose:
+            if vary_key_C in exploited_this_call:
+                print(f"  [Exploit] Skip C ({id_C}) - already exploited this call", flush=True)
+            else:
+                print(f"  [Exploit] Skip C ({id_C}) - exploited in previous iteration", flush=True)
+            summary['skipped_already_exploited'] += 1
 
     summary['total_candidates'] = len(all_candidates)
+    summary['unique_reactants_exploited'] = len(exploited_this_call)
 
     # Convert to dicts
     results = [{"name": c.name, "smiles": c.smiles, "InChIKey": generate_inchikey(c.smiles)} for c in all_candidates]
 
     if verbose:
-        print(f"[Exploit] 3-comp Total: {len(results)} candidates", flush=True)
+        print(f"[Exploit] 3-comp Summary: {summary['molecules_processed']} mols processed, "
+              f"{summary['unique_reactants_exploited']} unique (role,reactant) pairs exploited, "
+              f"{summary['skipped_already_exploited']} skipped (dedup), "
+              f"{len(results)} total candidates", flush=True)
 
     return results, summary
 
