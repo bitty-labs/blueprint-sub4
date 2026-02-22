@@ -1,25 +1,30 @@
 """
-v16 MINER - Anti-Convergence Edition
+v17 MINER - Full Composite Scoring on REACTANTS
 
-Based on v12 with three key additions to break local optima:
+Based on v16 with SIMPLIFIED mode structure:
 
-1. DIVERSITY TAX: After iteration 5, applies a penalty (0.005 per occurrence)
-   to molecules using overrepresented components. Aggressively favors
-   exploration of underused building blocks.
+ITERATION STRATEGY:
+- Iterations 1-5: Exploration (Region sampling, Synthon, GA)
+- Iteration 6+: EXPLOIT ONLY - no region resets, no amplification
 
-2. PRE-RESET EXPLOIT: At iterations 5, 11, 17, 23... (one before each reset),
-   runs fingerprint exploitation to squeeze maximum value from current optimum
-   before exploring new space.
+EXPLOIT APPROACH (v17):
+- Full composite scoring (Tanimoto + FCFP + Tversky) computed on REACTANTS
+- Take TOP 600 reactants by composite score per role
+- Generate products only for those 600
+- NO product-level fingerprint scoring needed
+- Products go directly to PSICHIC
 
-3. SCHEDULED REGION RESETS: At iterations 6, 12, 18, 24..., forces anti-dominant
-   exploration using region-based sampling. Periodically "pulses" the search
-   to explore underrepresented chemical space.
+The composite score on REACTANTS uses same weights as original product-level:
+  composite = 0.40*tanimoto + 0.35*fcfp + 0.25*tversky
 
-Key parameters:
-- REGION_RESET_INTERVAL = 6 (explore every 6 iters)
-- REGION_RESET_START = 6 (start resets at iter 6)
-- Diversity tax = 0.005 per occurrence in top_pool
-- Pre-reset exploit → Region reset → Exploit → Amplification (priority order)
+For each winner molecule (e.g., rxn:5:A:B:C):
+1. Keep A, B fixed → rank ALL C reactants by composite vs winner's C → take top 600
+2. Keep A, C fixed → rank ALL B reactants by composite vs winner's B → take top 600
+3. Keep B, C fixed → rank ALL A reactants by composite vs winner's A → take top 600
+4. Generate products for all selected reactants → PSICHIC scoring
+
+Still includes from v16:
+- DIVERSITY TAX: Penalty for overrepresented components
 """
 import os
 from traceback import print_exc
@@ -56,12 +61,9 @@ from molecules import (
     generate_inchikey,
     run_exploit,
     get_top_n_unexploited,
-    compute_diverse_components,
-    generate_diverse_molecules,
-    run_amplification,
-    # v12: Progressive amplification (full famy.py approach)
-    ProgressiveAmplificationState,
-    run_progressive_amplification,
+    # v17: Fast reactant-level exploit with FULL COMPOSITE on REACTANTS
+    ReactantExploitLibrary,
+    run_exploit_fast,
 )
 
 # v12: Region-based sampling (anti-dominant strategy)
@@ -69,10 +71,26 @@ from regions import RegionBasedSampler
 
 DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
 
-# Exploit settings
-TOP_N_EXPLOIT = 5                # Max molecules to consider per exploit call
-TARGET_REACTANTS = 15            # Target number of NEW (role,reactant) pairs per exploit (5 mols × 3 components)
-LIMIT_PER_REACTANT = 600         # Candidates per reactant (ranked by fingerprint similarity)
+# Exploit settings - differ by reaction type
+# 3-component reactions (rxn3, rxn5): more molecules, lower limit per reactant
+EXPLOIT_SETTINGS_3COMP = {
+    'top_n': 5,
+    'target_reactants': 15,      # 5 mols × 3 components
+    'limit_per_reactant': 600,
+}
+# 2-component reactions (rxn1, rxn2, rxn4): fewer molecules, higher limit per reactant
+EXPLOIT_SETTINGS_2COMP = {
+    'top_n': 2,
+    'target_reactants': 4,       # 2 mols × 2 components
+    'limit_per_reactant': 2000,
+}
+
+def get_exploit_settings(rxn_id: int) -> dict:
+    """Get exploit settings based on reaction type."""
+    if rxn_id in (3, 5):  # 3-component reactions
+        return EXPLOIT_SETTINGS_3COMP
+    else:  # 2-component reactions (1, 2, 4)
+        return EXPLOIT_SETTINGS_2COMP
 
 target_models = []
 antitarget_models = []
@@ -235,6 +253,11 @@ def main(config: dict):
     top_pool = pd.DataFrame(columns=["name", "smiles", "InChIKey", "score", "Target", "Anti"])
     rxn_id = int(config["allowed_reaction"].split(":")[-1])
     print(f"[Miner] rxn_id={rxn_id}", flush=True)
+
+    # Get exploit settings based on reaction type
+    exploit_settings = get_exploit_settings(rxn_id)
+    print(f"[Miner] Exploit settings: top_n={exploit_settings['top_n']}, target={exploit_settings['target_reactants']}, limit={exploit_settings['limit_per_reactant']}", flush=True)
+
     iteration = 0
 
     mutation_prob = 0.25
@@ -258,28 +281,30 @@ def main(config: dict):
     # Enhanced first iteration - good exploration
     n_samples_first_iteration = base_n_samples * 4 if config["allowed_reaction"] != "rxn:5" else base_n_samples * 2
 
-    # Mode tracking - iterations 1-17: GA/Synthon, 18-21: Exploit, 22+: Progressive Amplification
-    exploit_start_iteration = 18
-    exploit_end_iteration = 21
-    amplification_start_iteration = 22
-    amplification_end_iteration = 999  # runs until end
-    use_amplification_mode = False
+    # v17: SIMPLIFIED MODE STRUCTURE
+    # - Iterations 1-5: Exploration (Region sampling, Synthon, GA)
+    # - Iteration 6+: EXPLOIT ONLY (no region resets, no amplification)
+    exploit_start_iteration = 6
     use_exploit_mode = False
-    seen_names = set()  # Track all molecule names for exploit/amplification
+    seen_names = set()  # Track all molecule names for exploit
     exploited_reactants = set()  # Track which reactants have been exploited
-    amplification_rounds = 0  # Track amplification iteration count
 
-    # v12: Progressive amplification state (persists across rounds, like famy.py)
-    progressive_amp_state = None
+    # Expansion levels for exploit: start small, expand when exhausted
+    # For 2C: 2 → 10 → 50 winners
+    # For 3C: 5 → 15 → 50 winners
+    if rxn_id in (3, 5):
+        EXPLOIT_EXPANSION_LEVELS = [5, 15, 50]
+    else:
+        EXPLOIT_EXPANSION_LEVELS = [2, 10, 50]
+    current_exploit_level_idx = 0
 
-    # v16: Cached region sampler for scheduled exploration windows
+    # Cached region sampler (only used for iterations 1-2)
     cached_region_sampler = None
 
-    # v16: Scheduled exploration window settings
-    REGION_RESET_INTERVAL = 6  # Run anti-dominant exploration every N iterations
-    REGION_RESET_START = 6     # Start scheduled resets after this iteration
+    # v17: Fast reactant-level exploit library (precomputes all reactant fingerprints)
+    reactant_exploit_lib = None
 
-    print(f"[Miner] Entering main loop (v16: pre-reset exploit at 5,11,17..., region reset at 6,12,18..., diversity tax=0.005)...", flush=True)
+    print(f"[Miner] v17: iterations 1-5 exploration, iteration 6+ EXPLOIT ONLY", flush=True)
 
     # Use single CPU worker - proven pattern reduces overhead, improves stability
     with ProcessPoolExecutor(max_workers=2) as cpu_executor:
@@ -288,30 +313,24 @@ def main(config: dict):
             iter_start_time = time.time()
             print(f"[Miner] === Starting iteration {iteration} ===", flush=True)
 
-            # Switch to exploit mode at iteration 15-20
-            if iteration >= exploit_start_iteration and iteration <= exploit_end_iteration and not use_exploit_mode:
+            # v17: Switch to EXPLOIT ONLY mode at iteration 6+
+            if iteration >= exploit_start_iteration and not use_exploit_mode:
                 use_exploit_mode = True
-                use_amplification_mode = False
-                seen_names = set(top_pool["name"].tolist())
-                bt.logging.info(f"[Miner] Switching to EXPLOIT MODE at iteration {iteration}")
-                print(f"[Miner] Switching to EXPLOIT MODE at iteration {iteration}", flush=True)
-
-            # Switch to progressive amplification mode at iteration 21+
-            if iteration >= amplification_start_iteration and not use_amplification_mode:
-                use_amplification_mode = True
-                use_exploit_mode = False  # Turn off exploit
                 seen_names = set(top_pool["name"].tolist())
 
-                # v12: Initialize ProgressiveAmplificationState (famy.py approach)
-                try:
-                    progressive_amp_state = ProgressiveAmplificationState(DB_PATH, rxn_id)
-                    bt.logging.info(f"[Miner] Initialized ProgressiveAmplificationState for rxn:{rxn_id}")
-                except Exception as e:
-                    bt.logging.error(f"[Miner] Failed to initialize ProgressiveAmplificationState: {e}")
-                    progressive_amp_state = None
+                # Initialize ReactantExploitLibrary for FAST reactant-level exploit
+                if reactant_exploit_lib is None:
+                    try:
+                        exploit_lib_start = time.time()
+                        reactant_exploit_lib = ReactantExploitLibrary(DB_PATH, rxn_id)
+                        bt.logging.info(f"[Miner] Initialized ReactantExploitLibrary in {time.time() - exploit_lib_start:.1f}s")
+                        print(f"[Miner] ReactantExploitLibrary ready (precomputed all reactant fingerprints)", flush=True)
+                    except Exception as e:
+                        bt.logging.error(f"[Miner] Failed to initialize ReactantExploitLibrary: {e}")
+                        reactant_exploit_lib = None
 
-                bt.logging.info(f"[Miner] Switching to PROGRESSIVE AMPLIFICATION MODE at iteration {iteration}")
-                print(f"[Miner] Switching to PROGRESSIVE AMPLIFICATION MODE at iteration {iteration}", flush=True)
+                bt.logging.info(f"[Miner] Switching to EXPLOIT ONLY MODE at iteration {iteration}")
+                print(f"[Miner] Switching to EXPLOIT ONLY MODE at iteration {iteration}", flush=True)
 
             # Adaptive n_samples: maintain good throughput
             remaining_time = 2700 - (time.time() - start)
@@ -343,32 +362,29 @@ def main(config: dict):
             elite_df = select_diverse_elites(top_pool, min(150, len(top_pool))) if not top_pool.empty else pd.DataFrame()
             elite_names = elite_df["name"].tolist() if not elite_df.empty else None
 
-            # v16: CHECK FOR SCHEDULED REGION RESET FIRST (takes priority over exploit/amplification)
-            is_region_reset_iteration = (
-                iteration >= REGION_RESET_START and
-                iteration % REGION_RESET_INTERVAL == 0 and
-                not top_pool.empty
-            )
+            # v17: EXPLOIT MODE - iteration 6+ uses FAST reactant-level exploitation
+            if use_exploit_mode and not top_pool.empty:
+                bt.logging.info(f"[Miner] Iteration {iteration}: EXPLOIT MODE - FAST reactant-level")
 
-            # v16: PRE-RESET EXPLOIT - maximize current optimum right before resetting
-            # Runs at iterations 5, 11, 17, 23, 29... (one before each reset)
-            is_pre_reset_exploit_iteration = (
-                iteration >= REGION_RESET_START - 1 and
-                (iteration + 1) % REGION_RESET_INTERVAL == 0 and
-                not top_pool.empty
-            )
-
-            # v16: PRE-RESET EXPLOIT (squeeze out best molecules before reset)
-            if is_pre_reset_exploit_iteration:
-                print(f"[Miner] Iteration {iteration}: PRE-RESET EXPLOIT (maximizing before reset)...", flush=True)
-                bt.logging.info(f"[Miner] Iteration {iteration}: v16 pre-reset exploit to maximize current optimum")
-
-                # Get molecules with unexploited reactants
+                # Get molecules with unexploited reactants using current expansion level
                 all_pool_mols = top_pool.to_dict("records")
-                top_mols = get_top_n_unexploited(all_pool_mols, exploited_reactants, n=TOP_N_EXPLOIT, target_reactants=TARGET_REACTANTS)
+                current_top_n = EXPLOIT_EXPANSION_LEVELS[current_exploit_level_idx]
+                # Scale target_reactants with top_n (2 roles for 2C, 3 roles for 3C)
+                num_roles = 3 if rxn_id in (3, 5) else 2
+                current_target_reactants = current_top_n * num_roles
+
+                top_mols = get_top_n_unexploited(all_pool_mols, exploited_reactants, n=current_top_n, target_reactants=current_target_reactants)
+
+                # If exhausted at current level, try expanding
+                while not top_mols and current_exploit_level_idx < len(EXPLOIT_EXPANSION_LEVELS) - 1:
+                    current_exploit_level_idx += 1
+                    current_top_n = EXPLOIT_EXPANSION_LEVELS[current_exploit_level_idx]
+                    current_target_reactants = current_top_n * num_roles
+                    print(f"[Miner] Expanding exploit to top-{current_top_n} winners...", flush=True)
+                    top_mols = get_top_n_unexploited(all_pool_mols, exploited_reactants, n=current_top_n, target_reactants=current_target_reactants)
 
                 if not top_mols:
-                    bt.logging.warning(f"[Miner] All reactants exhausted for pre-reset exploit, using GA")
+                    bt.logging.warning(f"[Miner] All reactants exhausted at all levels, falling back to GA")
                     data = generate_valid_random_molecules_batch(
                         rxn_id,
                         n_samples=n_samples,
@@ -382,210 +398,97 @@ def main(config: dict):
                         component_weights=component_weights,
                     )
                 else:
-                    print(f"[Miner] Pre-reset exploit: {len(top_mols)} molecules selected (targeting {TARGET_REACTANTS} new reactants, {len(exploited_reactants)} already done)...", flush=True)
+                    print(f"[Miner] Iteration {iteration}: FAST EXPLOIT (level {current_exploit_level_idx+1}) - {len(top_mols)} winners (top-{current_top_n}), {len(exploited_reactants)} reactants done...", flush=True)
 
                     exploit_start = time.time()
                     try:
-                        exploit_results, exploit_summary = run_exploit(
-                            top_molecules=top_mols,
-                            db_path=DB_PATH,
-                            rxn_id=rxn_id,
-                            top_n=TOP_N_EXPLOIT,
-                            limit_per_reactant=LIMIT_PER_REACTANT,
-                            avoid_names=seen_names,
-                            exploited_reactants=exploited_reactants,
-                            min_heavy_atoms=config.get('min_heavy_atoms', 20),
-                            min_rotatable=config.get('min_rotatable_bonds', 1),
-                            max_rotatable=config.get('max_rotatable_bonds', 10)
-                        )
+                        # v17: FAST exploit with FULL COMPOSITE on REACTANTS
+                        if reactant_exploit_lib is not None:
+                            exploit_results, exploit_summary = run_exploit_fast(
+                                top_molecules=top_mols,
+                                exploit_lib=reactant_exploit_lib,
+                                rxn_id=rxn_id,
+                                top_n=current_top_n,  # Use current expansion level
+                                top_k_per_role=exploit_settings['limit_per_reactant'],
+                                avoid_names=seen_names,
+                                exploited_reactants=exploited_reactants,
+                                min_heavy_atoms=config.get('min_heavy_atoms', 20),
+                                min_rotatable=config.get('min_rotatable_bonds', 1),
+                                max_rotatable=config.get('max_rotatable_bonds', 10)
+                            )
+                        else:
+                            # Fallback to old exploit if library not available
+                            bt.logging.warning(f"[Miner] ReactantExploitLibrary not available, using slow exploit")
+                            exploit_results, exploit_summary = run_exploit(
+                                top_molecules=top_mols,
+                                db_path=DB_PATH,
+                                rxn_id=rxn_id,
+                                top_n=current_top_n,  # Use current expansion level
+                                limit_per_reactant=exploit_settings['limit_per_reactant'],
+                                avoid_names=seen_names,
+                                exploited_reactants=exploited_reactants,
+                                min_heavy_atoms=config.get('min_heavy_atoms', 20),
+                                min_rotatable=config.get('min_rotatable_bonds', 1),
+                                max_rotatable=config.get('max_rotatable_bonds', 10)
+                            )
 
+                        # ALWAYS update exploited reactants
                         if exploit_summary and 'exploited_reactant_ids' in exploit_summary:
                             exploited_reactants.update(exploit_summary['exploited_reactant_ids'])
 
                         exploit_time = time.time() - exploit_start
-                        bt.logging.info(f"[Miner] Pre-reset exploit returned {len(exploit_results)} candidates in {exploit_time:.1f}s")
+                        bt.logging.info(f"[Miner] FAST Exploit: {len(exploit_results)} candidates in {exploit_time:.1f}s")
 
                         if exploit_results:
                             data = pd.DataFrame(exploit_results)
                             seen_names.update(data["name"].tolist())
                         else:
-                            bt.logging.warning(f"[Miner] Pre-reset exploit returned no results, falling back to GA")
-                            data = generate_valid_random_molecules_batch(
-                                rxn_id,
-                                n_samples=n_samples,
-                                db_path=DB_PATH,
-                                subnet_config=config,
-                                batch_size=400,
-                                elite_names=elite_names,
-                                elite_frac=elite_frac,
-                                mutation_prob=mutation_prob,
-                                avoid_inchikeys=seen_inchikeys,
-                                component_weights=component_weights,
-                            )
-                    except Exception as e:
-                        bt.logging.error(f"[Miner] Pre-reset exploit failed: {e}")
-                        print_exc()
-                        data = generate_valid_random_molecules_batch(
-                            rxn_id,
-                            n_samples=n_samples,
-                            db_path=DB_PATH,
-                            subnet_config=config,
-                            batch_size=400,
-                            elite_names=elite_names,
-                            elite_frac=elite_frac,
-                            mutation_prob=mutation_prob,
-                            avoid_inchikeys=seen_inchikeys,
-                            component_weights=component_weights,
-                        )
+                            # Exploit returned 0 - try expanding to next level
+                            expanded = False
+                            while current_exploit_level_idx < len(EXPLOIT_EXPANSION_LEVELS) - 1:
+                                current_exploit_level_idx += 1
+                                current_top_n = EXPLOIT_EXPANSION_LEVELS[current_exploit_level_idx]
+                                current_target_reactants = current_top_n * num_roles
+                                print(f"[Miner] Exploit exhausted, expanding to top-{current_top_n} winners...", flush=True)
 
-            # v16: SCHEDULED REGION EXPLORATION WINDOWS
-            # Every N iterations, force anti-dominant exploration to break local optima
-            elif is_region_reset_iteration:
-                print(f"[Miner] Iteration {iteration}: SCHEDULED REGION RESET (anti-dominant pulse)...", flush=True)
-                bt.logging.info(f"[Miner] Iteration {iteration}: v16 scheduled region exploration window")
+                                top_mols = get_top_n_unexploited(all_pool_mols, exploited_reactants, n=current_top_n, target_reactants=current_target_reactants)
+                                if top_mols:
+                                    # Retry exploit with expanded winners
+                                    exploit_results, exploit_summary = run_exploit_fast(
+                                        top_molecules=top_mols,
+                                        exploit_lib=reactant_exploit_lib,
+                                        rxn_id=rxn_id,
+                                        top_n=current_top_n,
+                                        top_k_per_role=exploit_settings['limit_per_reactant'],
+                                        avoid_names=seen_names,
+                                        exploited_reactants=exploited_reactants,
+                                        min_heavy_atoms=config.get('min_heavy_atoms', 20),
+                                        min_rotatable=config.get('min_rotatable_bonds', 1),
+                                        max_rotatable=config.get('max_rotatable_bonds', 10)
+                                    )
+                                    if exploit_summary and 'exploited_reactant_ids' in exploit_summary:
+                                        exploited_reactants.update(exploit_summary['exploited_reactant_ids'])
+                                    if exploit_results:
+                                        data = pd.DataFrame(exploit_results)
+                                        seen_names.update(data["name"].tolist())
+                                        expanded = True
+                                        print(f"[Miner] Expanded exploit generated {len(exploit_results)} molecules", flush=True)
+                                        break
 
-                try:
-                    region_start = time.time()
-
-                    # Build or reuse region sampler
-                    if cached_region_sampler is None:
-                        cached_region_sampler = RegionBasedSampler(DB_PATH, rxn_id)
-
-                    # Analyze current top_pool dominance
-                    def get_last_comp(name):
-                        parts = name.split(':')
-                        return parts[-1] if len(parts) >= 3 else ''
-
-                    pool_comp_counts = top_pool['name'].apply(get_last_comp).value_counts()
-                    dominant_comps = set(pool_comp_counts.head(5).index.tolist())
-                    bt.logging.info(f"[Miner] Top 5 dominant components to AVOID: {dominant_comps}")
-
-                    # Generate molecules explicitly avoiding dominant components
-                    # Heavy focus on rare/uncommon regions: 50% rare, 35% uncommon, 15% common
-                    region_molecules = cached_region_sampler.generate_region_stratified_molecules(
-                        n_samples=n_samples,
-                        rare_pct=0.50,
-                        uncommon_pct=0.35,
-                        common_pct=0.15,
-                        avoid_inchikeys=seen_inchikeys,
-                        subnet_config=config
-                    )
-
-                    region_time = time.time() - region_start
-                    bt.logging.info(f"[Miner] Scheduled region reset generated {len(region_molecules)} molecules in {region_time:.1f}s")
-
-                    if region_molecules:
-                        data = pd.DataFrame(region_molecules)
-
-                        # Extra filter: remove molecules with dominant components
-                        data['_last_comp'] = data['name'].apply(get_last_comp)
-                        pre_filter = len(data)
-                        data = data[~data['_last_comp'].isin(dominant_comps)]
-                        data = data.drop(columns=['_last_comp'])
-                        bt.logging.info(f"[Miner] Filtered out {pre_filter - len(data)} molecules with dominant components")
-                    else:
-                        data = pd.DataFrame(columns=["name", "smiles", "InChIKey"])
-
-                    # Supplement with pure random GA if needed
-                    if len(data) < n_samples // 2:
-                        n_supplement = n_samples - len(data)
-                        bt.logging.info(f"[Miner] Supplementing with {n_supplement} pure random exploration molecules")
-
-                        supplement_df = generate_valid_random_molecules_batch(
-                            rxn_id,
-                            n_samples=n_supplement,
-                            db_path=DB_PATH,
-                            subnet_config=config,
-                            batch_size=400,
-                            elite_names=None,  # No elite bias during reset
-                            elite_frac=0.0,
-                            mutation_prob=0.9,  # Very high mutation for diversity
-                            avoid_inchikeys=seen_inchikeys.union(set(data["InChIKey"].tolist()) if not data.empty else set()),
-                            component_weights=None,  # Pure random - no bias
-                        )
-                        data = pd.concat([data, supplement_df], ignore_index=True)
-                        data = data.drop_duplicates(subset=["InChIKey"], keep="first")
-
-                except Exception as e:
-                    bt.logging.error(f"[Miner] Scheduled region reset failed: {e}, falling back to GA")
-                    print_exc()
-                    data = generate_valid_random_molecules_batch(
-                        rxn_id,
-                        n_samples=n_samples,
-                        db_path=DB_PATH,
-                        subnet_config=config,
-                        batch_size=400,
-                        elite_names=None,
-                        elite_frac=0.0,
-                        mutation_prob=0.9,
-                        avoid_inchikeys=seen_inchikeys,
-                        component_weights=None,
-                    )
-
-            # EXPLOIT MODE: After iteration threshold, use fingerprint exploitation
-            elif use_exploit_mode and not top_pool.empty:
-                bt.logging.info(f"[Miner] Iteration {iteration}: EXPLOIT MODE - fingerprint exploitation")
-
-                # Get molecules with unexploited reactants (v4 approach)
-                all_pool_mols = top_pool.to_dict("records")
-                top_mols = get_top_n_unexploited(all_pool_mols, exploited_reactants, n=TOP_N_EXPLOIT, target_reactants=TARGET_REACTANTS)
-
-                if not top_mols:
-                    bt.logging.warning(f"[Miner] All reactants exhausted, falling back to GA")
-                    data = generate_valid_random_molecules_batch(
-                        rxn_id,
-                        n_samples=n_samples,
-                        db_path=DB_PATH,
-                        subnet_config=config,
-                        batch_size=400,
-                        elite_names=elite_names,
-                        elite_frac=elite_frac,
-                        mutation_prob=mutation_prob,
-                        avoid_inchikeys=seen_inchikeys,
-                        component_weights=component_weights,
-                    )
-                else:
-                    print(f"[Miner] Iteration {iteration}: EXPLOIT mode - {len(top_mols)} molecules selected (targeting {TARGET_REACTANTS} new reactants, {len(exploited_reactants)} already done)...", flush=True)
-
-                    exploit_start = time.time()
-                    try:
-                        exploit_results, exploit_summary = run_exploit(
-                            top_molecules=top_mols,
-                            db_path=DB_PATH,
-                            rxn_id=rxn_id,
-                            top_n=TOP_N_EXPLOIT,
-                            limit_per_reactant=LIMIT_PER_REACTANT,
-                            avoid_names=seen_names,
-                            exploited_reactants=exploited_reactants,
-                            min_heavy_atoms=config.get('min_heavy_atoms', 20),
-                            min_rotatable=config.get('min_rotatable_bonds', 1),
-                            max_rotatable=config.get('max_rotatable_bonds', 10)
-                        )
-
-                        # ALWAYS update exploited reactants (fix tracking bug)
-                        if exploit_summary and 'exploited_reactant_ids' in exploit_summary:
-                            exploited_reactants.update(exploit_summary['exploited_reactant_ids'])
-
-                        exploit_time = time.time() - exploit_start
-                        bt.logging.info(f"[Miner] Exploit returned {len(exploit_results)} candidates in {exploit_time:.1f}s (exploited_reactants={len(exploited_reactants)})")
-
-                        if exploit_results:
-                            data = pd.DataFrame(exploit_results)
-                            seen_names.update(data["name"].tolist())
-                        else:
-                            bt.logging.warning(f"[Miner] Exploit returned no results, falling back to GA")
-                            data = generate_valid_random_molecules_batch(
-                                rxn_id,
-                                n_samples=n_samples,
-                                db_path=DB_PATH,
-                                subnet_config=config,
-                                batch_size=400,
-                                elite_names=elite_names,
-                                elite_frac=elite_frac,
-                                mutation_prob=mutation_prob,
-                                avoid_inchikeys=seen_inchikeys,
-                                component_weights=component_weights,
-                            )
+                            if not expanded:
+                                bt.logging.warning(f"[Miner] Exploit exhausted at all levels, falling back to GA")
+                                data = generate_valid_random_molecules_batch(
+                                    rxn_id,
+                                    n_samples=n_samples,
+                                    db_path=DB_PATH,
+                                    subnet_config=config,
+                                    batch_size=400,
+                                    elite_names=elite_names,
+                                    elite_frac=elite_frac,
+                                    mutation_prob=mutation_prob,
+                                    avoid_inchikeys=seen_inchikeys,
+                                    component_weights=component_weights,
+                                )
                     except Exception as e:
                         bt.logging.error(f"[Miner] Exploit failed: {e}")
                         print_exc()
@@ -602,97 +505,7 @@ def main(config: dict):
                             component_weights=component_weights,
                         )
 
-            # AMPLIFICATION MODE: Use PROGRESSIVE elite winner pattern amplification (famy.py approach)
-            elif use_amplification_mode and not top_pool.empty:
-                amplification_rounds += 1
-
-                # Different sample counts based on reaction type
-                # 3-component reactions (rxn 3, 5): 4500 samples, 100 elites
-                # 2-component reactions (rxn 1, 2, 4): 1500 samples, 100 elites
-                is_3_component = rxn_id in [3, 5]
-                amp_n_samples = 4500 if is_3_component else 1500
-                amp_elite_count = 100
-
-                bt.logging.info(f"[Miner] Iteration {iteration}: PROGRESSIVE AMPLIFICATION (round {amplification_rounds}, n_samples={amp_n_samples}, elites={amp_elite_count})")
-                print(f"[Miner] Iteration {iteration}: Running PROGRESSIVE AMPLIFICATION (round {amplification_rounds}, {'3-comp' if is_3_component else '2-comp'}, n={amp_n_samples}, elites={amp_elite_count})...", flush=True)
-
-                # Convert top_pool to list of dicts for amplification
-                top_mols = top_pool.head(amp_elite_count).to_dict("records")
-
-                amp_start = time.time()
-                try:
-                    # v12: Use progressive amplification (famy.py approach with memory)
-                    if progressive_amp_state is not None:
-                        amp_results, amp_summary = run_progressive_amplification(
-                            amp_state=progressive_amp_state,
-                            top_pool=top_mols,
-                            n_samples=amp_n_samples,
-                            avoid_names=seen_names,
-                            avoid_inchikeys=seen_inchikeys,
-                            similarity_threshold=0.7,
-                            min_heavy_atoms=config.get('min_heavy_atoms', 20),
-                            min_rotatable=config.get('min_rotatable_bonds', 1),
-                            max_rotatable=config.get('max_rotatable_bonds', 10),
-                            verbose=True
-                        )
-                    else:
-                        # Fallback to old amplification if state not initialized
-                        bt.logging.warning("[Miner] ProgressiveAmplificationState not available, using fallback")
-                        amp_results, amp_summary = run_amplification(
-                            top_molecules=top_mols,
-                            db_path=DB_PATH,
-                            rxn_id=rxn_id,
-                            n_samples=amp_n_samples,
-                            avoid_names=seen_names,
-                            avoid_inchikeys=seen_inchikeys,
-                            min_heavy_atoms=config.get('min_heavy_atoms', 20),
-                            min_rotatable=config.get('min_rotatable_bonds', 1),
-                            max_rotatable=config.get('max_rotatable_bonds', 10),
-                            verbose=True
-                        )
-
-                    amp_time = time.time() - amp_start
-                    bt.logging.info(f"[Miner] Progressive Amplification returned {len(amp_results)} candidates in {amp_time:.1f}s")
-
-                    if amp_results:
-                        data = pd.DataFrame(amp_results)
-                        seen_names.update(data["name"].tolist())
-
-                        # Log strategy breakdown
-                        for strategy, stats in amp_summary.get('strategies', {}).items():
-                            bt.logging.info(f"[Miner]   {strategy}: {stats.get('generated', 0)} generated")
-                    else:
-                        bt.logging.warning(f"[Miner] Progressive Amplification returned no results, falling back to GA")
-                        data = generate_valid_random_molecules_batch(
-                            rxn_id,
-                            n_samples=n_samples,
-                            db_path=DB_PATH,
-                            subnet_config=config,
-                            batch_size=400,
-                            elite_names=elite_names,
-                            elite_frac=elite_frac,
-                            mutation_prob=mutation_prob,
-                            avoid_inchikeys=seen_inchikeys,
-                            component_weights=component_weights,
-                        )
-
-                except Exception as e:
-                    bt.logging.error(f"[Miner] Progressive Amplification failed: {e}")
-                    print_exc()
-                    data = generate_valid_random_molecules_batch(
-                        rxn_id,
-                        n_samples=n_samples,
-                        db_path=DB_PATH,
-                        subnet_config=config,
-                        batch_size=400,
-                        elite_names=elite_names,
-                        elite_frac=elite_frac,
-                        mutation_prob=mutation_prob,
-                        avoid_inchikeys=seen_inchikeys,
-                        component_weights=component_weights,
-                    )
-
-            # v12: REGION-BASED SAMPLING (anti-dominant strategy)
+            # v17: REGION-BASED SAMPLING for iteration 1 (exploration phase)
             # Instead of Tanimoto diversity, sample from underexplored feature regions
             elif iteration == 1:
                 print(f"[Miner] Iteration 1: REGION-BASED SAMPLING for rxn:{rxn_id}...", flush=True)
@@ -1238,14 +1051,6 @@ def main(config: dict):
                 top_pool = pd.concat([top_pool, total_data], ignore_index=True)
                 top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
                 top_pool = top_pool.sort_values(by="score", ascending=False)
-
-                # v12: Update progressive amplification memory with scored results
-                if use_amplification_mode and progressive_amp_state is not None:
-                    try:
-                        scored_mols = total_data.to_dict("records")
-                        progressive_amp_state.update_learning_memory_with_results(scored_mols)
-                    except Exception as e:
-                        bt.logging.warning(f"[Miner] Failed to update progressive amp memory: {e}")
             else:
                 bt.logging.warning(f"[Miner] Iteration {iteration}: No valid scored data to add to pool")
 
@@ -1310,7 +1115,7 @@ def main(config: dict):
             # Write best molecules to result.json
             top_entries = {"molecules": top_pool["name"].tolist()}
 
-            mode_str = "EXPLOIT" if use_exploit_mode else ("AMPLIFY" if use_amplification_mode else "SYNTHON")
+            mode_str = "EXPLOIT" if use_exploit_mode else "EXPLORE"
             bt.logging.warning(
                 f"Iter {iteration} | {iter_total_time:.1f}s | Total: {total_time:.0f}s | "
                 f"Mode: {mode_str} | "

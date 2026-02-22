@@ -1772,6 +1772,388 @@ def run_exploit(
     return results, summary
 
 
+# =============================================================================
+# REACTANT-LEVEL EXPLOIT (FAST) - Pre-filter by reactant similarity
+# =============================================================================
+
+class ReactantExploitLibrary:
+    """
+    Precomputes fingerprints for all reactants to enable fast reactant-level
+    similarity filtering before generating products.
+
+    This is MUCH faster than product-level exploit because:
+    - Fingerprints are computed once at startup
+    - Bulk similarity is O(n) simple comparisons
+    - Only top-N similar reactants need product generation
+    """
+
+    def __init__(self, db_path: str, rxn_id: int):
+        self.db_path = db_path
+        self.rxn_id = rxn_id
+        self.reaction_info = get_reaction_info(rxn_id, db_path)
+
+        if not self.reaction_info:
+            raise ValueError(f"Could not load reaction {rxn_id}")
+
+        self.smarts, self.roleA, self.roleB, self.roleC = self.reaction_info
+        self.is_three_component = self.roleC is not None and self.roleC != 0
+
+        # Load all reactants (id, smiles, role_mask)
+        self.molecules_A = get_molecules_by_role(self.roleA, db_path)
+        self.molecules_B = get_molecules_by_role(self.roleB, db_path)
+        self.molecules_C = get_molecules_by_role(self.roleC, db_path) if self.is_three_component else []
+
+        # Build ID -> SMILES lookup
+        self.id_to_smiles_A = {mol_id: smiles for mol_id, smiles, _ in self.molecules_A}
+        self.id_to_smiles_B = {mol_id: smiles for mol_id, smiles, _ in self.molecules_B}
+        self.id_to_smiles_C = {mol_id: smiles for mol_id, smiles, _ in self.molecules_C} if self.is_three_component else {}
+
+        # Build fingerprint indices (Morgan + FCFP for both metrics)
+        bt.logging.info(f"[ReactantExploitLibrary] Building fingerprint indices for rxn:{rxn_id}...")
+        self.morgan_A, self.fcfp_A = self._build_dual_fingerprint_index(self.molecules_A)
+        self.morgan_B, self.fcfp_B = self._build_dual_fingerprint_index(self.molecules_B)
+        if self.is_three_component:
+            self.morgan_C, self.fcfp_C = self._build_dual_fingerprint_index(self.molecules_C)
+        else:
+            self.morgan_C, self.fcfp_C = {}, {}
+
+        # Pre-convert to lists for bulk similarity (ordered by mol_id)
+        self._prepare_bulk_arrays()
+
+        bt.logging.info(f"[ReactantExploitLibrary] Ready: {len(self.morgan_A)} A, {len(self.morgan_B)} B" +
+                       (f", {len(self.morgan_C)} C" if self.is_three_component else ""))
+
+    def _build_dual_fingerprint_index(self, molecules: List[Tuple[int, str, int]]) -> Tuple[Dict, Dict]:
+        """Build both Morgan and FCFP fingerprint indices."""
+        morgan_fps = {}
+        fcfp_fps = {}
+
+        fcfp_gen = rdFingerprintGenerator.GetMorganGenerator(radius=3, fpSize=2048,
+                                                              atomInvariantsGenerator=rdFingerprintGenerator.GetMorganFeatureAtomInvGen())
+
+        for mol_id, smiles, _ in molecules:
+            mol = _mol_from_smiles_cached(smiles)
+            if mol:
+                try:
+                    morgan_fps[mol_id] = MORGAN_FP_GENERATOR.GetFingerprint(mol)
+                    fcfp_fps[mol_id] = fcfp_gen.GetFingerprint(mol)
+                except Exception:
+                    continue
+
+        return morgan_fps, fcfp_fps
+
+    def _prepare_bulk_arrays(self):
+        """Prepare ordered arrays for bulk similarity computation."""
+        # Role A
+        self.ids_A = list(self.morgan_A.keys())
+        self.morgan_list_A = [self.morgan_A[i] for i in self.ids_A]
+        self.fcfp_list_A = [self.fcfp_A[i] for i in self.ids_A]
+
+        # Role B
+        self.ids_B = list(self.morgan_B.keys())
+        self.morgan_list_B = [self.morgan_B[i] for i in self.ids_B]
+        self.fcfp_list_B = [self.fcfp_B[i] for i in self.ids_B]
+
+        # Role C (if 3-component)
+        if self.is_three_component:
+            self.ids_C = list(self.morgan_C.keys())
+            self.morgan_list_C = [self.morgan_C[i] for i in self.ids_C]
+            self.fcfp_list_C = [self.fcfp_C[i] for i in self.ids_C]
+        else:
+            self.ids_C, self.morgan_list_C, self.fcfp_list_C = [], [], []
+
+    def get_winner_reactant_fps(self, winner_name: str) -> Dict:
+        """
+        Get fingerprints for a winner molecule's reactants.
+
+        Args:
+            winner_name: e.g., "rxn:1:123:456" or "rxn:5:123:456:789"
+
+        Returns:
+            Dict with 'A', 'B', 'C' keys containing (morgan_fp, fcfp_fp, smiles) tuples
+        """
+        parts = winner_name.split(":")
+        result = {}
+
+        if len(parts) >= 4:
+            id_A = int(parts[2])
+            id_B = int(parts[3])
+
+            if id_A in self.morgan_A:
+                result['A'] = (self.morgan_A[id_A], self.fcfp_A[id_A], self.id_to_smiles_A[id_A], id_A)
+            if id_B in self.morgan_B:
+                result['B'] = (self.morgan_B[id_B], self.fcfp_B[id_B], self.id_to_smiles_B[id_B], id_B)
+
+        if len(parts) == 5 and self.is_three_component:
+            id_C = int(parts[4])
+            if id_C in self.morgan_C:
+                result['C'] = (self.morgan_C[id_C], self.fcfp_C[id_C], self.id_to_smiles_C[id_C], id_C)
+
+        return result
+
+    def rank_reactants_by_composite(
+        self,
+        winner_name: str,
+        vary_role: str,
+        top_k: int = 600
+    ) -> List[Tuple[int, float, float, float, float]]:
+        """
+        v17: Rank all reactants by FULL COMPOSITE SCORE on REACTANTS.
+
+        Computes Tanimoto + FCFP + Tversky on reactant fingerprints,
+        same weights as product-level exploit: 0.40 + 0.35 + 0.25
+
+        Args:
+            winner_name: Winner molecule name
+            vary_role: 'A', 'B', or 'C' - which role to vary
+            top_k: Return top-K most similar (default 600)
+
+        Returns:
+            List of (mol_id, tanimoto, fcfp, tversky, composite) sorted by composite desc
+        """
+        winner_fps = self.get_winner_reactant_fps(winner_name)
+
+        if vary_role not in winner_fps:
+            bt.logging.warning(f"[ReactantExploit] Winner {winner_name} missing role {vary_role}")
+            return []
+
+        winner_morgan, winner_fcfp, _, winner_id = winner_fps[vary_role]
+
+        # Select the right pool
+        if vary_role == 'A':
+            ids, morgan_list, fcfp_list = self.ids_A, self.morgan_list_A, self.fcfp_list_A
+        elif vary_role == 'B':
+            ids, morgan_list, fcfp_list = self.ids_B, self.morgan_list_B, self.fcfp_list_B
+        else:
+            ids, morgan_list, fcfp_list = self.ids_C, self.morgan_list_C, self.fcfp_list_C
+
+        if not morgan_list:
+            return []
+
+        # BULK Tanimoto (Morgan) and FCFP
+        tanimoto_sims = DataStructs.BulkTanimotoSimilarity(winner_morgan, morgan_list)
+        fcfp_sims = DataStructs.BulkTanimotoSimilarity(winner_fcfp, fcfp_list)
+
+        # Compute full composite for ALL reactants (including Tversky)
+        results = []
+        for i, mol_id in enumerate(ids):
+            if mol_id == winner_id:
+                continue  # Skip the winner itself
+
+            tanimoto = tanimoto_sims[i]
+            fcfp = fcfp_sims[i]
+
+            # Tversky on Morgan fingerprints (alpha=0.7, beta=0.3)
+            tversky = DataStructs.TverskySimilarity(morgan_list[i], winner_morgan, 0.7, 0.3)
+
+            # Full composite score (same weights as product-level)
+            composite = (
+                STAGE2_WEIGHTS['tanimoto'] * tanimoto +
+                STAGE2_WEIGHTS['fcfp'] * fcfp +
+                STAGE2_WEIGHTS['tversky'] * tversky
+            )
+
+            results.append((mol_id, tanimoto, fcfp, tversky, composite))
+
+        # Sort by composite score descending and return top_k
+        results.sort(key=lambda x: x[4], reverse=True)
+
+        return results[:top_k]
+
+
+def run_exploit_fast(
+    top_molecules: List[Dict],
+    exploit_lib: ReactantExploitLibrary,
+    rxn_id: int,
+    top_n: int = 5,
+    top_k_per_role: int = 600,
+    avoid_names: set = None,
+    exploited_reactants: set = None,
+    min_heavy_atoms: int = 20,
+    min_rotatable: int = 1,
+    max_rotatable: int = 10,
+    verbose: bool = True
+) -> Tuple[List[Dict], Dict]:
+    """
+    v17: FAST exploit using FULL COMPOSITE SCORING on REACTANTS.
+
+    For each winner molecule:
+    1. Keep A, B fixed → rank ALL C reactants by composite similarity to winner's C
+    2. Take TOP 600 C reactants by composite score
+    3. Generate 600 products with those C reactants
+    4. Return directly to PSICHIC (no product-level fingerprint scoring needed)
+
+    Repeat for varying A (keep B, C fixed) and varying B (keep A, C fixed).
+
+    The composite score on REACTANTS uses same weights as product-level:
+    composite = 0.40*tanimoto + 0.35*fcfp + 0.25*tversky
+
+    Args:
+        top_molecules: Winner molecules to exploit
+        exploit_lib: Pre-initialized ReactantExploitLibrary
+        rxn_id: Reaction ID
+        top_n: Number of winner molecules to exploit
+        top_k_per_role: Top-K reactants to select per role (default 600)
+        avoid_names: Names to skip
+        exploited_reactants: Already exploited reactant IDs
+        min_heavy_atoms: Minimum heavy atom count for products
+        min_rotatable: Minimum rotatable bonds
+        max_rotatable: Maximum rotatable bonds
+        verbose: Print progress
+
+    Returns:
+        (list of candidate dicts, summary dict)
+    """
+    if avoid_names is None:
+        avoid_names = set()
+    if exploited_reactants is None:
+        exploited_reactants = set()
+
+    local_avoid = set(avoid_names)
+    is_three_component = exploit_lib.is_three_component
+
+    summary = {
+        'winners_processed': 0,
+        'reactants_scored': 0,
+        'reactants_selected': 0,
+        'products_generated': 0,
+        'products_valid': 0,
+        'exploited_reactant_ids': set()
+    }
+
+    all_candidates = []
+
+    for mol_info in top_molecules[:top_n]:
+        winner_name = mol_info.get("name", "")
+        if not winner_name:
+            continue
+
+        summary['winners_processed'] += 1
+
+        # Parse winner to get fixed reactant IDs
+        parts = winner_name.split(":")
+        if len(parts) < 4:
+            continue
+
+        try:
+            id_A = int(parts[2])
+            id_B = int(parts[3])
+            id_C = int(parts[4]) if len(parts) == 5 else None
+        except (ValueError, IndexError):
+            continue
+
+        # Determine which roles to vary based on what's not yet exploited
+        # Use tuple format (role, id) to match get_top_n_unexploited tracking
+        roles_to_vary = []
+        if ('A', id_A) not in exploited_reactants:
+            roles_to_vary.append(('A', id_A, id_B, id_C))
+        if ('B', id_B) not in exploited_reactants:
+            roles_to_vary.append(('B', id_A, id_B, id_C))
+        if is_three_component and id_C is not None and ('C', id_C) not in exploited_reactants:
+            roles_to_vary.append(('C', id_A, id_B, id_C))
+
+        for vary_role, fixed_A, fixed_B, fixed_C in roles_to_vary:
+            if verbose:
+                print(f"[ExploitV17] Winner {winner_name}: varying {vary_role}", flush=True)
+
+            # STEP 1: Rank ALL reactants by FULL COMPOSITE on REACTANTS
+            # Returns: (mol_id, tanimoto, fcfp, tversky, composite)
+            top_reactants = exploit_lib.rank_reactants_by_composite(
+                winner_name=winner_name,
+                vary_role=vary_role,
+                top_k=top_k_per_role
+            )
+
+            pool_size = len(exploit_lib.ids_A if vary_role == 'A' else
+                           exploit_lib.ids_B if vary_role == 'B' else
+                           exploit_lib.ids_C)
+            summary['reactants_scored'] += pool_size
+            summary['reactants_selected'] += len(top_reactants)
+
+            if verbose and top_reactants:
+                best = top_reactants[0]
+                print(f"[ExploitV17]   Scored {pool_size} reactants, selected top {len(top_reactants)}", flush=True)
+                print(f"[ExploitV17]   Best reactant: composite={best[4]:.3f} "
+                      f"(tan={best[1]:.2f}, fcfp={best[2]:.2f}, tver={best[3]:.2f})", flush=True)
+
+            # STEP 2: Generate products for TOP K reactants
+            role_candidates = []
+
+            for reactant_id, tan_sim, fcfp_sim, tversky_sim, composite in top_reactants:
+                # Build reaction name
+                if is_three_component:
+                    if vary_role == 'A':
+                        rxn_name = f"rxn:{rxn_id}:{reactant_id}:{fixed_B}:{fixed_C}"
+                    elif vary_role == 'B':
+                        rxn_name = f"rxn:{rxn_id}:{fixed_A}:{reactant_id}:{fixed_C}"
+                    else:  # C
+                        rxn_name = f"rxn:{rxn_id}:{fixed_A}:{fixed_B}:{reactant_id}"
+                else:
+                    if vary_role == 'A':
+                        rxn_name = f"rxn:{rxn_id}:{reactant_id}:{fixed_B}"
+                    else:  # B
+                        rxn_name = f"rxn:{rxn_id}:{fixed_A}:{reactant_id}"
+
+                if rxn_name in local_avoid:
+                    continue
+
+                # Generate product
+                product_smiles = _get_smiles_from_reaction_cached(rxn_name)
+                if not product_smiles:
+                    continue
+
+                summary['products_generated'] += 1
+
+                # Validate product properties
+                mol = _mol_from_smiles_cached(product_smiles)
+                if mol is None:
+                    continue
+
+                heavy_atoms = get_heavy_atom_count(product_smiles)
+                rotatable = Descriptors.NumRotatableBonds(mol)
+
+                if heavy_atoms < min_heavy_atoms:
+                    continue
+                if rotatable < min_rotatable or rotatable > max_rotatable:
+                    continue
+
+                summary['products_valid'] += 1
+
+                # Add candidate - ranked by REACTANT composite score
+                role_candidates.append({
+                    "name": rxn_name,
+                    "smiles": product_smiles,
+                    "InChIKey": generate_inchikey(product_smiles),
+                    "reactant_composite": composite,
+                    "reactant_tanimoto": tan_sim,
+                    "reactant_fcfp": fcfp_sim,
+                    "reactant_tversky": tversky_sim,
+                })
+
+                local_avoid.add(rxn_name)
+
+            all_candidates.extend(role_candidates)
+
+            if verbose:
+                print(f"[ExploitV17]   Generated {len(role_candidates)} valid products", flush=True)
+
+            # Mark reactant as exploited - use tuple format (role, id) for rxn:5
+            if vary_role == 'A':
+                summary['exploited_reactant_ids'].add(('A', fixed_A))
+            elif vary_role == 'B':
+                summary['exploited_reactant_ids'].add(('B', fixed_B))
+            else:
+                summary['exploited_reactant_ids'].add(('C', fixed_C))
+
+    if verbose:
+        print(f"[ExploitV17] Summary: {summary['reactants_scored']} scored -> "
+              f"{summary['reactants_selected']} selected (top {top_k_per_role}) -> "
+              f"{summary['products_generated']} generated -> "
+              f"{summary['products_valid']} valid", flush=True)
+
+    return all_candidates, summary
+
+
 def _exploit_3comp(
     top_molecules: List[Dict],
     db_path: str,

@@ -165,8 +165,9 @@ def _extract_features_rdkit(mol, smiles: str) -> FrozenSet[str]:
     if o_count >= 4:
         features.add('O4+')
 
-    # Heavy atom count (size)
-    heavy = mol.GetNumHeavyAtoms()
+    # Heavy atom count (size) - use naive function for consistency
+    from nova_ph2.utils.molecules import get_heavy_atom_count
+    heavy = get_heavy_atom_count(smiles)
     if heavy < 15:
         features.add('tiny')
     elif heavy < 25:
